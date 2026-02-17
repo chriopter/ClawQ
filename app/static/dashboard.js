@@ -1,0 +1,478 @@
+function esc(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function setMini(id, text) {
+  const element = byId(id);
+  if (element) element.textContent = text;
+}
+
+function short(value, max = 34) {
+  const str = String(value || "");
+  return str.length > max ? `${str.slice(0, max - 3)}...` : str;
+}
+
+async function fetchJson(url) {
+  const response = await fetch(url, { credentials: "same-origin" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+function setError(targetId, message) {
+  const element = byId(targetId);
+  if (!element) return;
+  element.innerHTML = `<div class="error-box">${esc(message)}</div>`;
+}
+
+function renderSyncStatus(data) {
+  const target = byId("syncStatus");
+  if (!target) return;
+
+  const dirty = Number(data.dirty_count || 0);
+  const ahead = Number(data.ahead || 0);
+  const behind = Number(data.behind || 0);
+
+  let label = "Unknown";
+  let cls = "sync-badge";
+  if (data.status === "synced") {
+    label = "Synced";
+    cls += " ok";
+  } else if (data.status === "dirty") {
+    label = "Dirty";
+    cls += " warn";
+  } else if (data.status === "ahead") {
+    label = "Ahead";
+    cls += " warn";
+  } else if (data.status === "behind") {
+    label = "Behind";
+    cls += " warn";
+  } else if (data.status === "diverged") {
+    label = "Diverged";
+    cls += " bad";
+  } else {
+    label = "No Upstream";
+  }
+
+  const dirtyFiles = (data.dirty_files || [])
+    .slice(0, 3)
+    .map((file) => `<code title="${esc(file)}">${esc(short(file, 42))}</code>`)
+    .join(" ");
+
+  target.innerHTML = `
+    <span class="${cls}">${esc(label)}</span>
+    <span class="sync-meta">${esc(data.branch || "-")}${data.upstream ? ` -> ${esc(data.upstream)}` : ""}</span>
+    <span class="sync-meta">ahead ${ahead} / behind ${behind} / dirty ${dirty}</span>
+    ${dirtyFiles ? `<span class="sync-files">${dirtyFiles}</span>` : ""}
+  `;
+
+  const shortSummary = `${label} | ${data.branch || "-"} | dirty ${dirty}`;
+  setMini("memorySummaryMini", shortSummary);
+
+  const badge = byId("memoryStatusBadge");
+  if (badge) {
+    badge.textContent = label;
+    badge.className = "status-pill neutral";
+    if (label === "Synced") badge.className = "status-pill ok";
+    else if (["Dirty", "Ahead", "Behind"].includes(label)) badge.className = "status-pill warn";
+    else if (label === "Diverged") badge.className = "status-pill bad";
+  }
+}
+
+function renderSystem(data) {
+  const target = byId("systemStatusResources");
+  const pill = byId("systemHealthPill");
+  if (!target || !pill) return;
+
+  const cpu = Number(data.cpu_percent || 0);
+  const mem = Number(data.memory?.percent || 0);
+  const disk = Number(data.disk_root?.percent || 0);
+
+  setMini("systemStatusSummaryMini", `CPU ${cpu.toFixed(0)}% MEM ${mem.toFixed(0)}% DISK ${disk.toFixed(0)}%`);
+  pill.textContent = data.clawq?.running ? "healthy" : "degraded";
+  pill.className = data.clawq?.running ? "pill ok" : "pill warn";
+
+  const meter = (label, value, tone) => `
+    <div class="metric metric-meter">
+      <span class="k">${esc(label)}</span>
+      <strong>${esc(value.toFixed(1))}%</strong>
+      <div class="meter"><span class="meter-fill ${tone}" style="width:${Math.max(0, Math.min(100, value))}%"></span></div>
+    </div>`;
+
+  target.innerHTML = `
+    ${meter("CPU", cpu, "tone-a")}
+    ${meter("Memory", mem, "tone-b")}
+    ${meter("Disk", disk, "tone-c")}
+    <div class="metric"><span class="k">Uptime</span><strong>${esc(data.app_uptime_seconds)}s</strong></div>
+    <div class="metric"><span class="k">ClawQ</span><strong>${esc(data.clawq.message)}</strong></div>
+    <div class="metric"><span class="k">Timestamp</span><strong>${esc(data.timestamp)}</strong></div>
+  `;
+}
+
+function renderUsage(data) {
+  const target = byId("systemStatusUsage");
+  if (!target) return;
+  const stats = data.stats || {};
+  const totalSessions = Number(stats.total_sessions || 0);
+  const totalMessages = Number(stats.total_messages || 0);
+  const profiles = Object.keys(data.profiles || {}).length;
+  const creds = Object.keys(data.credentials || {}).length;
+
+  const spark = (stats.daily_activity || [])
+    .slice(-5)
+    .map((row) => `<span class="spark" style="height:${8 + Math.min(30, Number(row.messageCount || 0) / 80)}px"></span>`)
+    .join("");
+
+  target.innerHTML = `
+    <div class="metric-grid">
+      <div class="metric"><span class="k">Sessions</span><strong>${totalSessions}</strong></div>
+      <div class="metric"><span class="k">Messages</span><strong>${totalMessages}</strong></div>
+      <div class="metric"><span class="k">Profiles</span><strong>${profiles}</strong></div>
+      <div class="metric"><span class="k">Credentials</span><strong>${creds}</strong></div>
+    </div>
+    <div class="sparkline-wrap"><span class="k">Recent activity</span><div class="sparkline">${spark || ""}</div></div>
+  `;
+}
+
+function renderSettings(data) {
+  const target = byId("systemStatusSettings");
+  if (!target) return;
+  target.innerHTML = `
+    <ul class="kv-list">
+      <li><span>Cookie secure</span><strong>${data.cookie_secure ? "true" : "false"}</strong></li>
+      <li><span>Password env</span><strong>${data.password_env_set ? "set" : "missing"}</strong></li>
+      <li><span>Secret env</span><strong>${data.cookie_secret_env_set ? "set" : "derived"}</strong></li>
+      <li><span>README exists</span><strong>${data.readme_exists ? "yes" : "no"}</strong></li>
+    </ul>
+  `;
+}
+
+function renderStt(data) {
+  const target = byId("systemStatusStt");
+  if (!target) return;
+  const models = data.models || [];
+  const items = models
+    .slice(0, 6)
+    .map((model) => {
+      const label = model.provider || model.command || model.type || "unknown";
+      const detail = model.model || model.endpoint || "";
+      return `<li><span>${esc(short(label, 18))}</span><code title="${esc(detail)}">${esc(short(detail, 26))}</code></li>`;
+    })
+    .join("");
+
+  target.innerHTML = `
+    <div class="metric-grid">
+      <div class="metric"><span class="k">Active</span><strong>${data.active ? "yes" : "no"}</strong></div>
+      <div class="metric"><span class="k">Models</span><strong>${models.length}</strong></div>
+    </div>
+    <ul class="compact-list compact-two">${items || "<li>No models configured</li>"}</ul>
+  `;
+}
+
+function getWorkspaceFromJob(job) {
+  const sessionTarget = String(job.sessionTarget || "");
+  if (sessionTarget.startsWith("agent:")) {
+    const parts = sessionTarget.split(":");
+    if (parts.length > 1 && parts[1]) return parts[1];
+  }
+  if (job.agentId) return String(job.agentId);
+  return "global";
+}
+
+function renderCrons(data) {
+  const target = byId("cronContent");
+  if (!target) return;
+  const jobs = data.jobs || [];
+  setMini("cronSummaryMini", `${jobs.length} jobs`);
+
+  const rows = jobs
+    .slice()
+    .sort((a, b) => {
+      const aKind = (a.schedule?.kind || "").toLowerCase();
+      const bKind = (b.schedule?.kind || "").toLowerCase();
+      const aOrder = aKind === "cron" ? 0 : 1;
+      const bOrder = bKind === "cron" ? 0 : 1;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      return getWorkspaceFromJob(a).localeCompare(getWorkspaceFromJob(b)) || String(a.name || a.id || "").localeCompare(String(b.name || b.id || ""));
+    })
+    .map((job, index) => {
+      const workspace = getWorkspaceFromJob(job);
+      const enabled = job.enabled !== false;
+      const name = job.name || job.id || "unnamed";
+      const schedule = job.schedule?.expr || job.schedule?.kind || "n/a";
+      const kind = (job.schedule?.kind || "").toLowerCase() === "cron" ? "repeat" : "once";
+      const detailId = `cron-detail-${index}`;
+      const detailText = String(job.payload?.message || job.payload?.text || "").trim();
+      const detail = detailText || JSON.stringify(job.payload || {}, null, 2);
+      return `
+        <tr class="cron-row" data-detail-id="${esc(detailId)}" tabindex="0" role="button" aria-expanded="false">
+          <td title="${esc(workspace)}">${esc(short(workspace, 16))}</td>
+          <td title="${esc(name)}">${esc(short(name, 44))}</td>
+          <td>${enabled ? "enabled" : "off"}</td>
+          <td><span class="cron-kind ${kind === "once" ? "once" : "repeat"}">${kind}</span></td>
+          <td title="${esc(schedule)}"><code>${esc(short(schedule, 18))}</code></td>
+        </tr>
+        <tr id="${esc(detailId)}" class="cron-detail" hidden>
+          <td colspan="5"><pre>${esc(detail)}</pre></td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  target.innerHTML = rows
+    ? `
+      <div class="table-wrap">
+        <table class="data-table fixed-cols">
+          <colgroup>
+            <col class="col-workspace" />
+            <col class="col-name" />
+            <col class="col-status" />
+            <col class="col-kind" />
+            <col class="col-schedule" />
+          </colgroup>
+          <thead>
+            <tr><th>Workspace</th><th>Job</th><th>Status</th><th>Type</th><th>Schedule</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    `
+    : "<div class='content-empty'>No jobs found</div>";
+
+  const cronRows = Array.from(target.querySelectorAll(".cron-row"));
+  for (const row of cronRows) {
+    const detailId = row.getAttribute("data-detail-id");
+    if (!detailId) continue;
+    const detail = byId(detailId);
+    if (!detail) continue;
+
+    const toggle = () => {
+      const expanded = row.getAttribute("aria-expanded") === "true";
+      row.setAttribute("aria-expanded", expanded ? "false" : "true");
+      detail.hidden = expanded;
+    };
+
+    row.addEventListener("click", toggle);
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        toggle();
+      }
+    });
+  }
+}
+
+function renderMapping(data) {
+  const target = byId("systemStatusMapping");
+  if (!target) return;
+  const channels = Object.keys(data.channels || {}).length;
+  const bindings = data.bindings || [];
+  const signalBindings = data.signal_bindings || [];
+  const sessions = data.sessions || [];
+  const signalContacts = Number(data.signal?.contact_count || 0);
+  const signalGroups = Number(data.signal?.group_count || 0);
+
+  const bindingRows = signalBindings
+    .slice(0, 8)
+    .map((binding) => {
+      const agent = binding.agent_id || binding.agentId || binding.agent || "-";
+      const kind = binding.target_kind || binding.match?.peer?.kind || "-";
+      const target = binding.target_id || binding.match?.peer?.id || "-";
+      return `<li><span>${esc(short(agent, 16))}</span><strong>${esc(kind)}</strong><code title="${esc(target)}">${esc(short(target, 24))}</code></li>`;
+    })
+    .join("");
+
+  const sessionRows = sessions
+    .slice(0, 10)
+    .map((session) => `<li><span>${esc(short(session.agent, 16))}</span><code title="${esc(session.key)}">${esc(short(session.key, 28))}</code></li>`)
+    .join("");
+
+  target.innerHTML = `
+    <div class="metric-grid">
+      <div class="metric"><span class="k">Channels</span><strong>${channels}</strong></div>
+      <div class="metric"><span class="k">Bindings</span><strong>${signalBindings.length}</strong></div>
+      <div class="metric"><span class="k">Signal Contacts</span><strong>${signalContacts}</strong></div>
+      <div class="metric"><span class="k">Signal Groups</span><strong>${signalGroups}</strong></div>
+      <div class="metric"><span class="k">Sessions</span><strong>${sessions.length}</strong></div>
+      <div class="metric"><span class="k">Default Workspace</span><strong>${esc(data.default_workspace || "-")}</strong></div>
+    </div>
+    <div class="two-col">
+      <div><h3>Bindings</h3><ul class="compact-list">${bindingRows || "<li>No bindings</li>"}</ul></div>
+      <div><h3>Mapped Sessions</h3><ul class="compact-list compact-two">${sessionRows || "<li>No sessions</li>"}</ul></div>
+    </div>
+  `;
+
+  const summary = `${bindings.length} bindings | ${sessions.length} sessions`;
+  const current = byId("systemStatusSummaryMini")?.textContent || "";
+  if (!current.includes("bindings")) {
+    setMini("systemStatusSummaryMini", `${current} | ${summary}`.replace(/^\s*\|\s*/, ""));
+  }
+}
+
+function renderRepos(data) {
+  const target = byId("reposContent");
+  if (!target) return;
+
+  const repos = data.repos || [];
+  const workspaces = data.workspaces || [];
+  const summary = data.summary || { total: repos.length, synced: 0, unsynced: 0 };
+  setMini("reposSummaryMini", `${workspaces.length} workspaces | ${summary.total} repos | ${summary.unsynced} unsynced`);
+
+  const statusBadge = (status) => `<span class="repo-badge ${esc((status || "unknown").toLowerCase())}">${esc(status || "unknown")}</span>`;
+
+  const rows = repos
+    .slice()
+    .sort((a, b) => String(a.workspace || "").localeCompare(String(b.workspace || "")) || String(a.name || "").localeCompare(String(b.name || "")))
+    .map((repo) => {
+      const track = `${repo.branch || "-"}${repo.upstream ? ` -> ${repo.upstream}` : ""}`;
+      const dirty = Number(repo.dirty_count || 0);
+      const staleBadge = repo.stale_uncommitted
+        ? `<span class="alert-badge" title="Uncommitted changes and last push older than 24h">stale >24h</span>`
+        : "";
+      return `
+        <tr>
+          <td title="${esc(repo.workspace || "unknown")}">${esc(short(repo.workspace || "unknown", 14))}</td>
+          <td title="${esc(repo.path || repo.name)}">${esc(short(repo.name || "repo", 22))}</td>
+          <td>${statusBadge(repo.status)}</td>
+          <td title="${esc(track)}"><code>${esc(short(track, 26))}</code></td>
+          <td>${dirty}</td>
+          <td>${staleBadge}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  const workspaceLabels = workspaces
+    .slice(0, 10)
+    .map((workspace) => `<code title="${esc(workspace)}">${esc(short(workspace, 24))}</code>`)
+    .join("");
+
+  target.innerHTML = rows
+    ? `
+      <div class="workspace-list-row">
+        <span class="k">Workspaces</span>
+        <div class="workspace-tags">${workspaceLabels || "<span class='content-empty'>none</span>"}</div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table fixed-cols">
+          <colgroup>
+            <col class="col-workspace" />
+            <col class="col-name" />
+            <col class="col-status" />
+            <col class="col-track" />
+            <col class="col-small" />
+            <col class="col-alert" />
+          </colgroup>
+          <thead>
+            <tr><th>Workspace</th><th>Repo</th><th>Status</th><th>Branch/Upstream</th><th>Dirty</th><th>Alert</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    `
+    : "<div class='content-empty'>No repositories found under /root/workspaces/*/data/repos</div>";
+}
+
+function initNavigation() {
+  const buttons = Array.from(document.querySelectorAll(".nav-btn"));
+  const views = Array.from(document.querySelectorAll(".view"));
+
+  function activate(viewName) {
+    for (const button of buttons) {
+      button.classList.toggle("active", button.dataset.view === viewName);
+    }
+    for (const view of views) {
+      view.classList.toggle("active", view.id === `view-${viewName}`);
+    }
+  }
+
+  for (const button of buttons) {
+    button.addEventListener("click", () => activate(button.dataset.view));
+  }
+
+  window.addEventListener("keydown", (event) => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    const tag = (event.target && event.target.tagName) ? event.target.tagName.toLowerCase() : "";
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+
+    const key = event.key;
+    if (!["1", "2"].includes(key)) return;
+    const targetButton = buttons.find((button) => button.dataset.hotkey === key);
+    if (!targetButton) return;
+
+    activate(targetButton.dataset.view);
+  });
+}
+
+function initCollapsibles() {
+  function applyExpandedState(toggle, body, expanded) {
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    body.hidden = !expanded;
+    body.style.display = expanded ? "" : "none";
+  }
+
+  const toggles = Array.from(document.querySelectorAll(".widget-toggle"));
+  for (const toggle of toggles) {
+    const targetId = toggle.getAttribute("data-target");
+    const body = targetId ? byId(targetId) : null;
+    if (!body) continue;
+
+    const key = `clawq-widget-${targetId}`;
+    const defaultExpanded = toggle.getAttribute("aria-expanded") === "true";
+    const stored = localStorage.getItem(key);
+    const expanded = stored === null ? defaultExpanded : stored === "1";
+    applyExpandedState(toggle, body, expanded);
+
+    toggle.addEventListener("click", (event) => {
+      event.preventDefault();
+      const nextExpanded = toggle.getAttribute("aria-expanded") !== "true";
+      applyExpandedState(toggle, body, nextExpanded);
+      localStorage.setItem(key, nextExpanded ? "1" : "0");
+    });
+  }
+}
+
+async function loadAll() {
+  const loaders = [
+    ["/api/system-resources", renderSystem, "systemStatusResources", "Failed to load system resources"],
+    ["/api/usage-stats", renderUsage, "systemStatusUsage", "Failed to load usage stats"],
+    ["/api/stt-status", renderStt, "systemStatusStt", "Failed to load speech-to-text status"],
+    ["/api/settings", renderSettings, "systemStatusSettings", "Failed to load settings"],
+    ["/api/mapping", renderMapping, "systemStatusMapping", "Failed to load mapping"],
+    ["/api/crons", renderCrons, "cronContent", "Failed to load cron jobs"],
+    ["/api/repos-status", renderRepos, "reposContent", "Failed to load repositories status"],
+    ["/api/workspaces-sync", renderSyncStatus, "syncStatus", "Failed to load workspaces sync"],
+  ];
+
+  await Promise.all(
+    loaders.map(async ([url, renderer, targetId, errorLabel]) => {
+      try {
+        renderer(await fetchJson(url));
+      } catch (error) {
+        setError(targetId, `${errorLabel}: ${error.message}`);
+      }
+    })
+  );
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  initNavigation();
+  initCollapsibles();
+  loadAll();
+  setInterval(async () => {
+    try {
+      renderSystem(await fetchJson("/api/system-resources"));
+      renderSyncStatus(await fetchJson("/api/workspaces-sync"));
+    } catch {
+      // keep current values on transient failures
+    }
+  }, 7000);
+});

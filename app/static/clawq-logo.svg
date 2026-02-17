@@ -1,0 +1,31 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">ClawQ Logo</title>
+  <desc id="desc">Stylized C-shaped claw around a Q core.</desc>
+  <defs>
+    <linearGradient id="bg" x1="48" y1="40" x2="456" y2="472" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B2C47"/>
+      <stop offset="1" stop-color="#114B5F"/>
+    </linearGradient>
+    <linearGradient id="claw" x1="104" y1="120" x2="386" y2="366" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#35C7A7"/>
+      <stop offset="1" stop-color="#1AA3B2"/>
+    </linearGradient>
+    <linearGradient id="core" x1="188" y1="170" x2="339" y2="342" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FBFF"/>
+      <stop offset="1" stop-color="#C8E6F2"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bg)"/>
+
+  <path d="M397 179C366 140 322 116 271 110C201 102 135 137 99 197C63 257 67 335 111 390L165 344C136 312 129 266 149 227C169 188 209 161 253 161C285 161 315 175 336 199L397 179Z" fill="url(#claw)"/>
+
+  <path d="M408 227L349 220L354 156L408 227Z" fill="#7FE6D4"/>
+  <path d="M392 291L337 268L370 214L392 291Z" fill="#59D8C4"/>
+  <path d="M359 349L313 314L362 271L359 349Z" fill="#3BC9C0"/>
+
+  <circle cx="256" cy="256" r="88" fill="url(#core)"/>
+  <path d="M255 196C291 196 320 225 320 261C320 288 304 311 281 321L306 346L281 370L247 336C212 332 185 302 185 266C185 227 216 196 255 196ZM255 232C236 232 220 247 220 266C220 285 236 300 255 300C274 300 289 285 289 266C289 247 274 232 255 232Z" fill="#0C3D5C"/>
+
+  <rect x="56" y="430" width="400" height="18" rx="9" fill="#2A6D89" opacity="0.7"/>
+</svg>

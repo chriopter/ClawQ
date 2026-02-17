@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ClawQ</title>
+    <link rel="icon" type="image/svg+xml" href="/static/clawq-logo.svg" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script defer src="/static/dashboard.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img class="logo" src="/static/clawq-logo.svg" alt="ClawQ logo" />
+        <strong>ClawQ</strong>
+      </div>
+      <form method="post" action="/logout">
+        <button type="submit" class="btn-secondary">Logout</button>
+      </form>
+    </header>
+
+    <main class="layout">
+      <section class="card">
+        <div class="card-head">
+          <h2>Repos</h2>
+          <span id="reposSummaryMini" class="meta">Loading...</span>
+        </div>
+        <div class="card-body">
+          <div id="reposContent" class="content-empty">Loading...</div>
+        </div>
+      </section>
+
+      <section class="card collapsible" data-widget="memory-readme">
+        <button type="button" class="card-head widget-toggle" data-target="memoryBody" aria-expanded="false">
+          <span class="card-title">Memory</span>
+          <span id="memoryStatusBadge" class="status-pill neutral">checking</span>
+          <span id="memorySummaryMini" class="meta">README.md</span>
+          <span class="chevron">▾</span>
+        </button>
+        <div class="card-body" id="memoryBody" hidden>
+          <div class="memory-link-row">
+            <a href="https://git.home.lan/chriopter/marvin-workspaces" target="_blank" rel="noopener noreferrer">Open marvin-workspaces repository</a>
+          </div>
+          <div id="syncStatus" class="sync-strip">Checking /root/workspaces sync...</div>
+          <article class="readme-prose">{{ readme_html | safe }}</article>
+        </div>
+      </section>
+
+      <section class="card collapsible" data-widget="cron-inline">
+        <button type="button" class="card-head widget-toggle" data-target="cronBodyInline" aria-expanded="true">
+          <span class="card-title">Cron Jobs</span>
+          <span id="cronSummaryMini" class="meta">Loading...</span>
+          <span class="chevron">▾</span>
+        </button>
+        <div class="card-body" id="cronBodyInline">
+          <div id="cronContent" class="content-empty">Loading...</div>
+        </div>
+      </section>
+
+      <section class="card collapsible" data-widget="system-status">
+        <button type="button" class="card-head widget-toggle" data-target="systemStatusExtra" aria-expanded="false">
+          <span class="card-title">System Status</span>
+          <span id="systemStatusSummaryMini" class="meta">Loading...</span>
+          <span class="chevron">▾</span>
+        </button>
+        <div class="card-body">
+          <div class="pill-row"><span id="systemHealthPill" class="pill">live</span></div>
+          <div class="status-panel">
+            <h3>Resources</h3>
+            <div id="systemStatusResources" class="metric-grid"></div>
+          </div>
+          <div class="status-grid" id="systemStatusExtra" hidden>
+            <div class="status-panel">
+              <h3>Usage</h3>
+              <div id="systemStatusUsage" class="content-empty">Loading...</div>
+            </div>
+            <div class="status-panel">
+              <h3>Speech-to-Text</h3>
+              <div id="systemStatusStt" class="content-empty">Loading...</div>
+            </div>
+            <div class="status-panel">
+              <h3>Settings</h3>
+              <div id="systemStatusSettings" class="content-empty">Loading...</div>
+            </div>
+            <div class="status-panel span-2">
+              <h3>Mapping</h3>
+              <div id="systemStatusMapping" class="content-empty">Loading...</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

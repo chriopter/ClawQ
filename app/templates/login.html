@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ClawQ Login</title>
+    <link rel="icon" type="image/svg+xml" href="/static/clawq-logo.svg" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body class="auth-page">
+    <main class="auth-card">
+      <img class="logo" src="/static/clawq-logo.svg" alt="ClawQ logo" />
+      <h1>ClawQ WebGUI</h1>
+      <p>Enter password to access health and workspace status.</p>
+      {% if error %}
+      <div class="error">{{ error }}</div>
+      {% endif %}
+      <form method="post" action="/login">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+        <button type="submit">Sign in</button>
+      </form>
+    </main>
+  </body>
+</html>

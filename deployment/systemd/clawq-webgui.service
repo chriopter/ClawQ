@@ -1,0 +1,15 @@
+[Unit]
+Description=ClawQ Web GUI
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/workspaces/personal/data/repos/ClawQ
+EnvironmentFile=/etc/default/clawq-webgui
+ExecStart=/root/workspaces/personal/data/repos/ClawQ/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
