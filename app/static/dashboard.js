@@ -16,6 +16,19 @@ function setMini(id, text) {
   if (element) element.textContent = text;
 }
 
+function setNavState(stateId, detailId, label, tone = "neutral", detail = "") {
+  const state = byId(stateId);
+  if (state) {
+    state.textContent = label;
+    state.className = `nav-state ${tone}`;
+  }
+
+  const detailEl = byId(detailId);
+  if (detailEl) {
+    detailEl.textContent = detail;
+  }
+}
+
 function short(value, max = 34) {
   const str = String(value || "");
   return str.length > max ? `${str.slice(0, max - 3)}...` : str;
@@ -33,6 +46,310 @@ function setError(targetId, message) {
   element.innerHTML = `<div class="error-box">${esc(message)}</div>`;
 }
 
+function syncTone(status) {
+  if (["synced", "repos_synced"].includes(status)) return "ok";
+  if (["dirty", "ahead", "behind", "repos_unsynced", "not_git_repo"].includes(status)) return "warn";
+  if (["diverged", "missing"].includes(status)) return "bad";
+  return "neutral";
+}
+
+const SCAN_INTERVAL_MS = 5000;
+let notifyTargetsState = null;
+let memorySaveState = null;
+let memorySaveFeedback = "";
+
+function formatShortTime(isoValue) {
+  if (!isoValue) return "-";
+  const date = new Date(isoValue);
+  if (Number.isNaN(date.getTime())) return String(isoValue);
+  return date.toISOString().replace("T", " ").replace(".000Z", "Z");
+}
+
+function renderNotifyMeta(notify) {
+  const status = String(notify?.status || "unknown");
+  const target = String(notify?.target_label || notify?.target || "-");
+  const tone = status === "sent"
+    ? "ok"
+    : ["no_target", "signal_channel_disabled", "missing_signal_account"].includes(status)
+      ? "warn"
+      : "bad";
+  return `<span class="sync-badge ${tone}">notify ${esc(status)}</span><span class="sync-meta">target ${esc(target)}</span>`;
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+function notifyOptions() {
+  return Array.isArray(notifyTargetsState?.options) ? notifyTargetsState.options : [];
+}
+
+function defaultTargetValue() {
+  return String(notifyTargetsState?.default_target || "");
+}
+
+function defaultTargetLabel() {
+  const options = notifyOptions();
+  const match = options.find((option) => option.value === defaultTargetValue()) || options[0];
+  return match?.label || "Hauptkontakt";
+}
+
+function setRepoDefaultTargetNote() {
+  const note = byId("repoHookerDefaultTarget");
+  if (!note) return;
+  note.textContent = `Default: ${defaultTargetLabel()}`;
+}
+
+function setButtonFlash(button, text) {
+  if (!button) return;
+  const original = button.dataset.originalText || button.textContent || "Test";
+  button.dataset.originalText = original;
+  button.textContent = text;
+  window.setTimeout(() => {
+    button.textContent = button.dataset.originalText || "Test";
+  }, 1700);
+}
+
+function autosaveMode() {
+  return String(memorySaveState?.mode || "never");
+}
+
+function autosaveOptionsHtml(selectedMode) {
+  const options = Array.isArray(memorySaveState?.options) ? memorySaveState.options : [
+    { value: "never", label: "Nie" },
+    { value: "daily_23", label: "1x täglich (23:00)" },
+  ];
+  return options
+    .map((option) => {
+      const value = String(option?.value || "never");
+      const label = String(option?.label || value);
+      const selected = value === selectedMode ? " selected" : "";
+      return `<option value="${esc(value)}"${selected}>${esc(label)}</option>`;
+    })
+    .join("");
+}
+
+function setMemorySaveFeedback(message) {
+  memorySaveFeedback = String(message || "");
+  if (!memorySaveFeedback) return;
+  window.setTimeout(() => {
+    memorySaveFeedback = "";
+  }, 5000);
+}
+
+function applyMemorySaveConfig(data) {
+  if (!data || typeof data !== "object") return;
+  memorySaveState = data;
+}
+
+function bindMemorySaveControls() {
+  const saveBtn = byId("memorySaveNowBtn");
+  const modeSelect = byId("memoryAutosaveSelect");
+
+  if (modeSelect && modeSelect.dataset.bound !== "1") {
+    modeSelect.dataset.bound = "1";
+    modeSelect.addEventListener("change", async () => {
+      try {
+        const updated = await postJson("/api/memory-save-config", { mode: modeSelect.value });
+        applyMemorySaveConfig(updated);
+        setMemorySaveFeedback(updated.mode === "daily_23" ? "Auto 23:00 aktiv" : "Auto aus");
+        renderSyncStatus(await fetchJson("/api/workspaces-sync"));
+      } catch {
+        setMemorySaveFeedback("Auto-Update fehlgeschlagen");
+      }
+    });
+  }
+
+  if (saveBtn && saveBtn.dataset.bound !== "1") {
+    saveBtn.dataset.bound = "1";
+    saveBtn.addEventListener("click", async () => {
+      saveBtn.disabled = true;
+      try {
+        const result = await postJson("/api/memory-save", { reason: "manual" });
+        if (result.config) applyMemorySaveConfig(result.config);
+        setMemorySaveFeedback(result.ok ? "Saved + pushed" : `Save failed: ${result.status || "error"}`);
+
+        const [syncData] = await Promise.all([
+          fetchJson("/api/workspaces-sync"),
+          refreshHookerPanels(),
+        ]);
+        renderSyncStatus(syncData);
+      } catch {
+        setMemorySaveFeedback("Save fehlgeschlagen");
+      } finally {
+        saveBtn.disabled = false;
+      }
+    });
+  }
+}
+
+async function runTestNotification(button, payload) {
+  if (!button) return;
+  button.disabled = true;
+  try {
+    const result = await postJson("/api/notify-targets/test", payload);
+    setButtonFlash(button, result.sent ? "Sent" : "Failed");
+  } catch {
+    setButtonFlash(button, "Error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function refreshHookerPanels() {
+  const [repoHookerData, memoryHookerData] = await Promise.all([
+    fetchJson("/api/repo-hooker"),
+    fetchJson("/api/memory-hooker"),
+  ]);
+  renderRepoHooker(repoHookerData);
+  renderMemoryHooker(memoryHookerData);
+}
+
+function renderMemoryTargetSelect(selectedValue) {
+  const select = byId("memoryHookerTargetSelect");
+  if (!select) return;
+
+  const options = notifyOptions();
+  if (!options.length) {
+    select.innerHTML = "<option value=''>No target</option>";
+    select.disabled = true;
+    return;
+  }
+
+  select.disabled = false;
+  select.innerHTML = options
+    .map((option) => {
+      const value = String(option?.value || "");
+      const label = String(option?.label || option?.value || "target");
+      return `<option value="${esc(value)}">${esc(label)}</option>`;
+    })
+    .join("");
+
+  if (selectedValue && options.some((option) => option.value === selectedValue)) {
+    select.value = selectedValue;
+  } else if (defaultTargetValue()) {
+    select.value = defaultTargetValue();
+  }
+
+  if (select.dataset.bound !== "1") {
+    select.dataset.bound = "1";
+    select.addEventListener("change", async () => {
+      try {
+        notifyTargetsState = await postJson("/api/notify-targets", { memory_target: select.value });
+        applyNotifyTargets(notifyTargetsState);
+        await refreshHookerPanels();
+      } catch {
+        // keep old value on transient failures
+      }
+    });
+  }
+}
+
+function bindMemoryTestButton() {
+  const button = byId("memoryHookerTestBtn");
+  const select = byId("memoryHookerTargetSelect");
+  if (!button || !select || button.dataset.bound === "1") return;
+
+  button.dataset.bound = "1";
+  button.addEventListener("click", async () => {
+    const target = String(select.value || defaultTargetValue() || "");
+    await runTestNotification(button, {
+      target,
+      scope: "memory",
+      repo: "memory",
+    });
+  });
+}
+
+function bindRepoDefaultTestButton() {
+  const button = byId("repoHookerDefaultTestBtn");
+  if (!button || button.dataset.bound === "1") return;
+
+  button.dataset.bound = "1";
+  button.addEventListener("click", async () => {
+    const target = defaultTargetValue();
+    await runTestNotification(button, {
+      target,
+      scope: "repo-default",
+      repo: "repo-default",
+    });
+  });
+}
+
+function repoTargetOptionsHtml(targetValue, isDefault) {
+  const options = notifyOptions();
+  const rows = [];
+  rows.push(`<option value="__default__"${isDefault ? " selected" : ""}>Default (${esc(defaultTargetLabel())})</option>`);
+  for (const option of options) {
+    const value = String(option?.value || "");
+    const label = String(option?.label || option?.value || "target");
+    const selected = !isDefault && value === targetValue;
+    rows.push(`<option value="${esc(value)}"${selected ? " selected" : ""}>${esc(label)}</option>`);
+  }
+  return rows.join("");
+}
+
+function bindRepoHookerControls(container) {
+  if (!container) return;
+
+  const selects = Array.from(container.querySelectorAll(".repo-target-select"));
+  for (const select of selects) {
+    if (select.dataset.bound === "1") continue;
+    select.dataset.bound = "1";
+    select.addEventListener("change", async () => {
+      const repoPath = String(select.dataset.repoPath || "");
+      if (!repoPath) return;
+      try {
+        notifyTargetsState = await postJson("/api/notify-targets/repo", {
+          repo_path: repoPath,
+          target: select.value,
+        });
+        applyNotifyTargets(notifyTargetsState);
+        await refreshHookerPanels();
+      } catch {
+        // keep old value on transient failures
+      }
+    });
+  }
+
+  const buttons = Array.from(container.querySelectorAll(".repo-test-btn"));
+  for (const button of buttons) {
+    if (button.dataset.bound === "1") continue;
+    button.dataset.bound = "1";
+    button.addEventListener("click", async () => {
+      const row = button.closest("tr");
+      const select = row ? row.querySelector(".repo-target-select") : null;
+      let target = select ? String(select.value || "") : "";
+      if (target === "__default__") {
+        target = defaultTargetValue();
+      }
+
+      await runTestNotification(button, {
+        target,
+        scope: "repo",
+        repo: String(button.dataset.repoName || "repo"),
+        branch: String(button.dataset.repoBranch || ""),
+      });
+    });
+  }
+}
+
+function applyNotifyTargets(data) {
+  if (!data || typeof data !== "object") return;
+  notifyTargetsState = data;
+  setRepoDefaultTargetNote();
+  renderMemoryTargetSelect(data.memory_target);
+  bindRepoDefaultTestButton();
+  bindMemoryTestButton();
+}
+
 function renderSyncStatus(data) {
   const target = byId("syncStatus");
   if (!target) return;
@@ -46,6 +363,12 @@ function renderSyncStatus(data) {
   if (data.status === "synced") {
     label = "Synced";
     cls += " ok";
+  } else if (data.status === "repos_synced") {
+    label = "Repos Synced";
+    cls += " ok";
+  } else if (data.status === "repos_unsynced") {
+    label = "Repos Unsynced";
+    cls += " warn";
   } else if (data.status === "dirty") {
     label = "Dirty";
     cls += " warn";
@@ -58,33 +381,56 @@ function renderSyncStatus(data) {
   } else if (data.status === "diverged") {
     label = "Diverged";
     cls += " bad";
+  } else if (data.status === "not_git_repo") {
+    label = "Not Git Repo";
+    cls += " warn";
+  } else if (data.status === "missing") {
+    label = "Missing";
+    cls += " bad";
   } else {
     label = "No Upstream";
   }
+
+  const syncDetail = ["repos_synced", "repos_unsynced"].includes(data.status)
+    ? `${dirty} unsynced repos`
+    : `ahead ${ahead} / behind ${behind} / dirty ${dirty}`;
+  const tone = syncTone(data.status);
 
   const dirtyFiles = (data.dirty_files || [])
     .slice(0, 3)
     .map((file) => `<code title="${esc(file)}">${esc(short(file, 42))}</code>`)
     .join(" ");
 
+  const mode = autosaveMode();
+  const modeHint = mode === "daily_23" ? "Auto 23:00" : "Auto aus";
+  const feedback = memorySaveFeedback || modeHint;
+
   target.innerHTML = `
     <span class="${cls}">${esc(label)}</span>
+    ${data.path ? `<span class="sync-meta">${esc(short(data.path, 56))}</span>` : ""}
     <span class="sync-meta">${esc(data.branch || "-")}${data.upstream ? ` -> ${esc(data.upstream)}` : ""}</span>
-    <span class="sync-meta">ahead ${ahead} / behind ${behind} / dirty ${dirty}</span>
+    <span class="sync-meta">${esc(syncDetail)}</span>
     ${dirtyFiles ? `<span class="sync-files">${dirtyFiles}</span>` : ""}
+    <span class="memory-save-controls">
+      <select id="memoryAutosaveSelect" class="memory-autosave-select" aria-label="Memory autosave mode">
+        ${autosaveOptionsHtml(mode)}
+      </select>
+      <button id="memorySaveNowBtn" type="button" class="btn-secondary btn-mini">Save</button>
+      <span id="memorySaveFeedback" class="sync-meta">${esc(feedback)}</span>
+    </span>
   `;
 
   const shortSummary = `${label} | ${data.branch || "-"} | dirty ${dirty}`;
   setMini("memorySummaryMini", shortSummary);
+  setNavState("navMemoryState", "navMemoryDetail", label, tone, short(syncDetail, 24));
 
   const badge = byId("memoryStatusBadge");
   if (badge) {
     badge.textContent = label;
-    badge.className = "status-pill neutral";
-    if (label === "Synced") badge.className = "status-pill ok";
-    else if (["Dirty", "Ahead", "Behind"].includes(label)) badge.className = "status-pill warn";
-    else if (label === "Diverged") badge.className = "status-pill bad";
+    badge.className = `status-pill ${tone}`;
   }
+
+  bindMemorySaveControls();
 }
 
 function renderSystem(data) {
@@ -99,6 +445,13 @@ function renderSystem(data) {
   setMini("systemStatusSummaryMini", `CPU ${cpu.toFixed(0)}% MEM ${mem.toFixed(0)}% DISK ${disk.toFixed(0)}%`);
   pill.textContent = data.clawq?.running ? "healthy" : "degraded";
   pill.className = data.clawq?.running ? "pill ok" : "pill warn";
+  setNavState(
+    "navStatusState",
+    "navStatusDetail",
+    data.clawq?.running ? "Running" : "Stopped",
+    data.clawq?.running ? "ok" : "bad",
+    `CPU ${cpu.toFixed(0)}%`
+  );
 
   const meter = (label, value, tone) => `
     <div class="metric metric-meter">
@@ -274,11 +627,12 @@ function renderMapping(data) {
   const target = byId("systemStatusMapping");
   if (!target) return;
   const channels = Object.keys(data.channels || {}).length;
-  const bindings = data.bindings || [];
   const signalBindings = data.signal_bindings || [];
   const sessions = data.sessions || [];
   const signalContacts = Number(data.signal?.contact_count || 0);
   const signalGroups = Number(data.signal?.group_count || 0);
+
+  setMini("mappingSummaryMini", `${signalGroups} groups | ${signalBindings.length} bindings`);
 
   const bindingRows = signalBindings
     .slice(0, 8)
@@ -309,12 +663,6 @@ function renderMapping(data) {
       <div><h3>Mapped Sessions</h3><ul class="compact-list compact-two">${sessionRows || "<li>No sessions</li>"}</ul></div>
     </div>
   `;
-
-  const summary = `${bindings.length} bindings | ${sessions.length} sessions`;
-  const current = byId("systemStatusSummaryMini")?.textContent || "";
-  if (!current.includes("bindings")) {
-    setMini("systemStatusSummaryMini", `${current} | ${summary}`.replace(/^\s*\|\s*/, ""));
-  }
 }
 
 function renderRepos(data) {
@@ -325,6 +673,7 @@ function renderRepos(data) {
   const workspaces = data.workspaces || [];
   const summary = data.summary || { total: repos.length, synced: 0, unsynced: 0 };
   setMini("reposSummaryMini", `${workspaces.length} workspaces | ${summary.total} repos | ${summary.unsynced} unsynced`);
+  updateReposSidebar(data);
 
   const statusBadge = (status) => `<span class="repo-badge ${esc((status || "unknown").toLowerCase())}">${esc(status || "unknown")}</span>`;
 
@@ -378,12 +727,180 @@ function renderRepos(data) {
         </table>
       </div>
     `
-    : "<div class='content-empty'>No repositories found under /root/workspaces/*/data/repos</div>";
+    : `<div class='content-empty'>No repositories found under ${esc(data.path || "configured root")}</div>`;
+}
+
+function updateReposSidebar(data) {
+  const summary = data?.summary || {};
+  const total = Number(summary.total || 0);
+  const unsynced = Number(summary.unsynced || 0);
+  const synced = Number(summary.synced || Math.max(0, total - unsynced));
+
+  if (total === 0) {
+    setNavState("navReposState", "navReposDetail", "No Repos", "neutral", "scan empty");
+    return;
+  }
+
+  const tone = unsynced === 0 ? "ok" : "warn";
+  const label = unsynced === 0 ? "Synced" : "Unsynced";
+  setNavState("navReposState", "navReposDetail", label, tone, `${synced}/${total} synced`);
+}
+
+function renderRepoHooker(data) {
+  const target = byId("repoHookerContent");
+  if (!target) return;
+
+  const repos = data.repos || [];
+  const events = data.events || [];
+  const defaultLabel = data.target_default?.label || defaultTargetLabel();
+  const statusTone = events.length > 0 ? "warn" : "ok";
+  const statusLabel = events.length > 0 ? "events detected" : "watching";
+  const lastEventAt = events.length > 0 ? (events[0].committed_at || data.checked_at) : data.checked_at;
+
+  setMini("repoHookerSummaryMini", `${repos.length} repos | ${events.length} recent events`);
+
+  const eventCards = events
+    .slice(0, 3)
+    .map((event) => `
+      <div class="hook-event-card">
+        <div class="hook-event-meta">
+          ${renderNotifyMeta(event.notify || {})}
+          <span class="sync-meta">${esc(event.repo || "repo")}/${esc(event.branch || "-")}</span>
+        </div>
+        <pre>${esc(event.message || "")}</pre>
+      </div>
+    `)
+    .join("");
+
+  const rows = repos
+    .slice()
+    .sort((a, b) => String(a.workspace || "").localeCompare(String(b.workspace || "")) || String(a.name || "").localeCompare(String(b.name || "")))
+    .slice(0, 18)
+    .map((repo) => {
+      const targetState = repo.notify_target || {};
+      const targetValue = String(targetState.value || "");
+      const isDefault = Boolean(targetState.is_default);
+      return `
+        <tr>
+          <td title="${esc(repo.workspace || "-")}">${esc(short(repo.workspace || "-", 14))}</td>
+          <td title="${esc(repo.name || "repo")}">${esc(short(repo.name || "repo", 22))}</td>
+          <td><code>${esc(repo.head_short || "-")}</code></td>
+          <td title="${esc(repo.subject || "")}">${esc(short(repo.subject || "-", 36))}</td>
+          <td>
+            <div class="hook-target-inline">
+              <select class="repo-target-select" data-repo-path="${esc(repo.path || "")}">
+                ${repoTargetOptionsHtml(targetValue, isDefault)}
+              </select>
+              <button type="button" class="btn-secondary btn-mini repo-test-btn" data-repo-name="${esc(repo.name || "repo")}" data-repo-branch="${esc(repo.branch || "")}">Test</button>
+            </div>
+          </td>
+          <td>${esc(formatShortTime(repo.committed_at))}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  target.innerHTML = `
+    <div class="sync-strip">
+      <span class="sync-badge ${statusTone}">${statusLabel}</span>
+      <span class="sync-meta">scans every ${SCAN_INTERVAL_MS / 1000}s</span>
+      <span class="sync-meta">default ${esc(defaultLabel)}</span>
+      <span class="sync-meta">overrides ${Number(data.repo_overrides_count || 0)}</span>
+      <span class="sync-meta">last event ${esc(formatShortTime(lastEventAt))}</span>
+    </div>
+    ${eventCards ? `<div class="hook-event-list">${eventCards}</div>` : ""}
+    ${rows
+      ? `<div class="table-wrap">
+          <table class="data-table fixed-cols">
+            <colgroup>
+              <col class="col-workspace" />
+              <col class="col-name" />
+              <col class="col-small" />
+              <col class="col-track" />
+              <col class="col-track" />
+              <col class="col-schedule" />
+            </colgroup>
+            <thead>
+              <tr><th>Workspace</th><th>Repo</th><th>Head</th><th>Latest Commit</th><th>Target</th><th>When</th></tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`
+      : "<div class='content-empty'>No repositories available for hook scan</div>"}
+  `;
+
+  bindRepoHookerControls(target);
+}
+
+function renderMemoryHooker(data) {
+  const target = byId("memoryHookerContent");
+  if (!target) return;
+
+  const targetLabel = data.target?.label || "Kein Ziel";
+  if (notifyTargetsState) {
+    renderMemoryTargetSelect(data.target?.value);
+  } else {
+    const select = byId("memoryHookerTargetSelect");
+    if (select) {
+      const fallbackValue = String(data.target?.value || "");
+      const fallbackLabel = String(data.target?.label || "Hauptkontakt");
+      select.innerHTML = `<option value="${esc(fallbackValue)}">${esc(fallbackLabel)}</option>`;
+      select.disabled = !fallbackValue;
+    }
+  }
+
+  if (!data.found) {
+    setMini("memoryHookerSummaryMini", "not found");
+    target.innerHTML = `<div class="error-box">Memory repository not found (${esc(data.reason || "unknown")}).</div>`;
+    setNavState("navMemoryState", "navMemoryDetail", "Missing", "bad", "memory repo missing");
+    return;
+  }
+
+  const event = data.event;
+  const tone = event ? "warn" : "ok";
+  const label = event ? "event tracked" : "watching";
+  setMini("memoryHookerSummaryMini", `${event ? 1 : 0} recent event | ${data.head_short || "-"}`);
+
+  const eventCard = event
+    ? `
+      <div class="hook-event-list">
+        <details class="hook-event-details">
+          <summary>Letzte Nachricht anzeigen</summary>
+          <div class="hook-event-card">
+            <div class="hook-event-meta">
+              ${renderNotifyMeta(event.notify || {})}
+              <span class="sync-meta">${esc(event.repo || "memory")}/${esc(event.branch || "-")}</span>
+            </div>
+            <pre>${esc(event.message || "")}</pre>
+          </div>
+        </details>
+      </div>
+    `
+    : "";
+
+  target.innerHTML = `
+    <div class="sync-strip">
+      <span class="sync-badge ${tone}">${label}</span>
+      <span class="sync-meta">branch ${esc(data.branch || "-")}</span>
+      <span class="sync-meta">head ${esc(data.head_short || "-")}</span>
+      <span class="sync-meta">target ${esc(targetLabel)}</span>
+      <span class="sync-meta">last event ${esc(formatShortTime(event?.committed_at || data.checked_at))}</span>
+    </div>
+    ${eventCard}
+    <ul class="kv-list">
+      <li><span>Repo Path</span><strong>${esc(short(data.repo_path || "-", 52))}</strong></li>
+      <li><span>README Path</span><strong>${esc(short(data.readme_path || "-", 52))}</strong></li>
+      <li><span>Latest Commit</span><strong title="${esc(data.subject || "")}">${esc(short(data.subject || "-", 62))}</strong></li>
+      <li><span>Committed At</span><strong>${esc(formatShortTime(data.committed_at))}</strong></li>
+    </ul>
+  `;
 }
 
 function initNavigation() {
   const buttons = Array.from(document.querySelectorAll(".nav-btn"));
   const views = Array.from(document.querySelectorAll(".view"));
+  if (!buttons.length || !views.length) return;
+  const storageKey = "clawq-active-view";
 
   function activate(viewName) {
     for (const button of buttons) {
@@ -392,11 +909,17 @@ function initNavigation() {
     for (const view of views) {
       view.classList.toggle("active", view.id === `view-${viewName}`);
     }
+    localStorage.setItem(storageKey, viewName);
   }
 
   for (const button of buttons) {
     button.addEventListener("click", () => activate(button.dataset.view));
   }
+
+  const storedView = localStorage.getItem(storageKey);
+  const defaultButton = buttons.find((button) => button.classList.contains("active")) || buttons[0];
+  const initialView = buttons.find((button) => button.dataset.view === storedView)?.dataset.view || defaultButton.dataset.view;
+  activate(initialView);
 
   window.addEventListener("keydown", (event) => {
     if (event.altKey || event.ctrlKey || event.metaKey) return;
@@ -404,40 +927,12 @@ function initNavigation() {
     if (tag === "input" || tag === "textarea" || tag === "select") return;
 
     const key = event.key;
-    if (!["1", "2"].includes(key)) return;
+    if (!["1", "2", "3"].includes(key)) return;
     const targetButton = buttons.find((button) => button.dataset.hotkey === key);
     if (!targetButton) return;
 
     activate(targetButton.dataset.view);
   });
-}
-
-function initCollapsibles() {
-  function applyExpandedState(toggle, body, expanded) {
-    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
-    body.hidden = !expanded;
-    body.style.display = expanded ? "" : "none";
-  }
-
-  const toggles = Array.from(document.querySelectorAll(".widget-toggle"));
-  for (const toggle of toggles) {
-    const targetId = toggle.getAttribute("data-target");
-    const body = targetId ? byId(targetId) : null;
-    if (!body) continue;
-
-    const key = `clawq-widget-${targetId}`;
-    const defaultExpanded = toggle.getAttribute("aria-expanded") === "true";
-    const stored = localStorage.getItem(key);
-    const expanded = stored === null ? defaultExpanded : stored === "1";
-    applyExpandedState(toggle, body, expanded);
-
-    toggle.addEventListener("click", (event) => {
-      event.preventDefault();
-      const nextExpanded = toggle.getAttribute("aria-expanded") !== "true";
-      applyExpandedState(toggle, body, nextExpanded);
-      localStorage.setItem(key, nextExpanded ? "1" : "0");
-    });
-  }
 }
 
 async function loadAll() {
@@ -461,18 +956,47 @@ async function loadAll() {
       }
     })
   );
+
+  try {
+    const [notifyTargetsData, memorySaveConfigData] = await Promise.all([
+      fetchJson("/api/notify-targets"),
+      fetchJson("/api/memory-save-config"),
+    ]);
+    applyNotifyTargets(notifyTargetsData);
+    applyMemorySaveConfig(memorySaveConfigData);
+    renderSyncStatus(await fetchJson("/api/workspaces-sync"));
+  } catch {
+    // keep selectors in fallback mode on transient failures
+  }
+
+  try {
+    await refreshHookerPanels();
+  } catch {
+    setError("repoHookerContent", "Failed to load repo hooker");
+    setError("memoryHookerContent", "Failed to load memory hooker");
+  }
 }
 
 window.addEventListener("DOMContentLoaded", () => {
   initNavigation();
-  initCollapsibles();
   loadAll();
   setInterval(async () => {
     try {
-      renderSystem(await fetchJson("/api/system-resources"));
-      renderSyncStatus(await fetchJson("/api/workspaces-sync"));
+      const [systemData, syncData, reposData, notifyTargetsData, memorySaveConfigData] = await Promise.all([
+        fetchJson("/api/system-resources"),
+        fetchJson("/api/workspaces-sync"),
+        fetchJson("/api/repos-status"),
+        fetchJson("/api/notify-targets"),
+        fetchJson("/api/memory-save-config"),
+      ]);
+      applyNotifyTargets(notifyTargetsData);
+      applyMemorySaveConfig(memorySaveConfigData);
+      renderSystem(systemData);
+      renderSyncStatus(syncData);
+      updateReposSidebar(reposData);
+      await refreshHookerPanels();
     } catch {
       // keep current values on transient failures
     }
-  }, 7000);
+  }, SCAN_INTERVAL_MS);
 });

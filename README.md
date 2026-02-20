@@ -37,6 +37,7 @@ Hooker notifications are always active.
 - `Memory Hooker` watches the repository that contains the Memory README (`/root/workspaces/README.md` by default).
 - Scan interval is 5 seconds.
 - Notifications are delivered through OpenClaw (`openclaw message send --channel signal ...`).
+- Notification texts are Signal-friendly formatted (bold headers, compact diff summary, commit link).
 
 Target routing:
 
@@ -50,6 +51,12 @@ Test buttons:
 - `Test` sends a real Signal test notification to the currently selected target.
 - If a target is empty/invalid in UI state, the backend falls back to the default main contact.
 
+Memory save controls:
+
+- In Memory sync strip, `Save` commits and pushes the memory repository directly.
+- Autosave mode supports `Nie` or `1x täglich (23:00)`.
+- Daily autosave runs once per day during the 23:00 hour (server local time).
+
 Auth cookie is long-lived (20 years) and effectively permanent unless password/secret changes or logout clears it.
 
 ## Routes
@@ -61,6 +68,8 @@ Auth cookie is long-lived (20 years) and effectively permanent unless password/s
 - `/api/notify-targets` get/update Signal notification targets (auth required)
 - `/api/notify-targets/repo` update per-repo target override (auth required)
 - `/api/notify-targets/test` send test notification to selected target (auth required)
+- `/api/memory-save-config` get/set memory save mode (auth required)
+- `/api/memory-save` commit+push memory repository now (auth required)
 - `/health` basic liveness
 - `/login` login form
 

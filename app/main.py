@@ -28,6 +28,7 @@ DEFAULT_REPOS_ROOT = Path("/root/git")
 LEGACY_WORKSPACES_ROOT = Path("/root/workspaces")
 DEFAULT_README_PATH = LEGACY_WORKSPACES_ROOT / "README.md"
 HOOKER_TARGETS_PATH = Path(os.path.expanduser("~/.openclaw/clawq-notify-targets.json"))
+MEMORY_SAVE_CONFIG_PATH = Path(os.path.expanduser("~/.openclaw/clawq-memory-save.json"))
 HOOKER_SCAN_SECONDS = 5
 
 REPO_HOOKER_LAST_HEADS: dict[str, str] = {}
@@ -36,6 +37,7 @@ REPO_HOOKER_EVENT_LOG: list[dict] = []
 MEMORY_HOOKER_LAST_EVENT: dict | None = None
 SIGNAL_GROUP_NAME_CACHE: dict = {"loaded_at": 0.0, "data": {}}
 HOOKER_STATE_LOCK = threading.Lock()
+MEMORY_SAVE_LOCK = threading.Lock()
 HOOKER_THREAD_STARTED = False
 
 
@@ -376,14 +378,14 @@ def _cron_jobs_data() -> dict:
     return {"jobs": jobs}
 
 
-def _run_git(cwd: Path, *args: str) -> tuple[bool, str]:
+def _run_git(cwd: Path, *args: str, timeout_seconds: int = 6) -> tuple[bool, str]:
     try:
         completed = subprocess.run(
             ["git", *args],
             cwd=str(cwd),
             capture_output=True,
             text=True,
-            timeout=6,
+            timeout=timeout_seconds,
         )
     except Exception:
         return False, ""
@@ -391,6 +393,211 @@ def _run_git(cwd: Path, *args: str) -> tuple[bool, str]:
     if completed.returncode != 0:
         return False, completed.stderr.strip() or completed.stdout.strip()
     return True, completed.stdout.strip()
+
+
+def _memory_save_mode(value: str | None) -> str:
+    if value == "daily_23":
+        return "daily_23"
+    return "never"
+
+
+def _memory_save_config() -> dict:
+    raw = _json_or_none(MEMORY_SAVE_CONFIG_PATH)
+    if not isinstance(raw, dict):
+        raw = {}
+
+    mode_raw = raw.get("mode") if isinstance(raw.get("mode"), str) else None
+    last_auto_day = raw.get("last_auto_day") if isinstance(raw.get("last_auto_day"), str) else ""
+    last_result = raw.get("last_result") if isinstance(raw.get("last_result"), dict) else {}
+    return {
+        "mode": _memory_save_mode(mode_raw),
+        "last_auto_day": last_auto_day,
+        "last_result": last_result,
+    }
+
+
+def _write_memory_save_config(config: dict) -> None:
+    payload = {
+        "mode": _memory_save_mode(config.get("mode") if isinstance(config, dict) else None),
+        "last_auto_day": str(config.get("last_auto_day") or "") if isinstance(config, dict) else "",
+        "last_result": config.get("last_result") if isinstance(config.get("last_result"), dict) else {},
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        MEMORY_SAVE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MEMORY_SAVE_CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _memory_save_config_data() -> dict:
+    config = _memory_save_config()
+    mode = _memory_save_mode(config.get("mode") if isinstance(config, dict) else None)
+    return {
+        "mode": mode,
+        "options": [
+            {"value": "never", "label": "Nie"},
+            {"value": "daily_23", "label": "1x täglich (23:00)"},
+        ],
+        "last_auto_day": config.get("last_auto_day", ""),
+        "last_result": config.get("last_result", {}),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _set_memory_save_mode(mode: str | None) -> dict:
+    config = _memory_save_config()
+    config["mode"] = _memory_save_mode(mode)
+    _write_memory_save_config(config)
+    return _memory_save_config_data()
+
+
+def _record_memory_save_result(result: dict, reason: str) -> None:
+    config = _memory_save_config()
+    config["last_result"] = {
+        "ok": bool(result.get("ok")),
+        "status": str(result.get("status") or "unknown"),
+        "reason": reason,
+        "checked_at": str(result.get("checked_at") or datetime.now(timezone.utc).isoformat()),
+    }
+    if reason == "auto_daily_23":
+        config["last_auto_day"] = datetime.now().date().isoformat()
+    _write_memory_save_config(config)
+
+
+def _memory_commit_message(reason: str) -> str:
+    if reason == "auto_daily_23":
+        return "chore(memory): daily autosave"
+    return "chore(memory): save workspace memory"
+
+
+def _memory_save_now(reason: str = "manual") -> dict:
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    with MEMORY_SAVE_LOCK:
+        repo_root = _resolve_memory_repo_root()
+        if not repo_root:
+            return {
+                "ok": False,
+                "status": "not_git_repo",
+                "repo_path": None,
+                "dirty_before": 0,
+                "committed": False,
+                "pushed": False,
+                "reason": reason,
+                "checked_at": checked_at,
+                "error": "Memory repository not found",
+            }
+
+        ok_repo, _ = _run_git(repo_root, "rev-parse", "--is-inside-work-tree")
+        if not ok_repo:
+            return {
+                "ok": False,
+                "status": "not_git_repo",
+                "repo_path": str(repo_root),
+                "dirty_before": 0,
+                "committed": False,
+                "pushed": False,
+                "reason": reason,
+                "checked_at": checked_at,
+                "error": "Target path is not a git repository",
+            }
+
+        ok_status, porcelain = _run_git(repo_root, "status", "--porcelain")
+        dirty_files = []
+        if ok_status and porcelain:
+            for line in porcelain.splitlines():
+                if len(line) >= 4:
+                    dirty_files.append(line[3:].strip())
+
+        dirty_before = len(dirty_files)
+        committed = False
+        commit_head = None
+        commit_message = None
+
+        if dirty_before > 0:
+            ok_add, add_out = _run_git(repo_root, "add", "-A", timeout_seconds=20)
+            if not ok_add:
+                return {
+                    "ok": False,
+                    "status": "add_failed",
+                    "repo_path": str(repo_root),
+                    "dirty_before": dirty_before,
+                    "committed": False,
+                    "pushed": False,
+                    "reason": reason,
+                    "checked_at": checked_at,
+                    "error": add_out,
+                }
+
+            commit_message = _memory_commit_message(reason)
+            ok_commit, commit_out = _run_git(repo_root, "commit", "-m", commit_message, timeout_seconds=30)
+            if not ok_commit:
+                lower = commit_out.lower()
+                if "nothing to commit" not in lower and "no changes added" not in lower:
+                    return {
+                        "ok": False,
+                        "status": "commit_failed",
+                        "repo_path": str(repo_root),
+                        "dirty_before": dirty_before,
+                        "committed": False,
+                        "pushed": False,
+                        "reason": reason,
+                        "checked_at": checked_at,
+                        "error": commit_out,
+                    }
+            else:
+                committed = True
+                ok_head, head_out = _run_git(repo_root, "rev-parse", "--short", "HEAD")
+                if ok_head and head_out:
+                    commit_head = head_out
+
+        ok_push, push_out = _run_git(repo_root, "push", timeout_seconds=45)
+        if not ok_push:
+            return {
+                "ok": False,
+                "status": "push_failed",
+                "repo_path": str(repo_root),
+                "dirty_before": dirty_before,
+                "committed": committed,
+                "commit_head": commit_head,
+                "commit_message": commit_message,
+                "pushed": False,
+                "reason": reason,
+                "checked_at": checked_at,
+                "error": push_out,
+            }
+
+        return {
+            "ok": True,
+            "status": "committed_and_pushed" if committed else "pushed",
+            "repo_path": str(repo_root),
+            "dirty_before": dirty_before,
+            "committed": committed,
+            "commit_head": commit_head,
+            "commit_message": commit_message,
+            "pushed": True,
+            "reason": reason,
+            "checked_at": checked_at,
+            "sync": _workspaces_sync_data(),
+        }
+
+
+def _run_memory_autosave_if_due() -> None:
+    config = _memory_save_config()
+    if config.get("mode") != "daily_23":
+        return
+
+    now = datetime.now()
+    today = now.date().isoformat()
+    if now.hour != 23:
+        return
+    if config.get("last_auto_day") == today:
+        return
+
+    result = _memory_save_now(reason="auto_daily_23")
+    _record_memory_save_result(result, reason="auto_daily_23")
 
 
 def _workspaces_sync_data() -> dict:
@@ -1042,9 +1249,11 @@ def _format_commit_notification(snapshot: dict, numstat: dict, commit_url: str |
     deletions_total = int(numstat.get("deletions") or 0) if isinstance(numstat, dict) else 0
 
     lines = [
+        "🧠 *ClawQ Update*",
         f"*Commit:* {subject}",
+        "─────",
         f"*Repo:* `{repo_name}/{branch}`",
-        f"*Change:* `{file_count} files +{additions_total} -{deletions_total}`",
+        f"*Änderung:* `{file_count} files +{additions_total} -{deletions_total}`",
     ]
 
     if rendered_files:
@@ -1053,13 +1262,18 @@ def _format_commit_notification(snapshot: dict, numstat: dict, commit_url: str |
         lines.extend(rendered_files)
         lines.append("```")
 
+    lines.append("─────")
+
     if commit_url:
         lines.append("")
-        lines.append(f"*Link:* {commit_url}")
+        lines.append(f"🔗 *Link:* {commit_url}")
     else:
         head_short = str(snapshot.get("head_short") or "-").replace("`", "'")
         lines.append("")
         lines.append(f"*Head:* `{head_short}`")
+
+    lines.append("")
+    lines.append("✨ Viel Erfolg beim Weitermachen!")
 
     return "\n".join(lines)
 
@@ -1512,6 +1726,7 @@ def _hooker_background_loop() -> None:
         try:
             _repo_hooker_data()
             _memory_hooker_data()
+            _run_memory_autosave_if_due()
         except Exception:
             pass
         time.sleep(HOOKER_SCAN_SECONDS)
@@ -1667,6 +1882,14 @@ def api_memory_hooker(request: Request):
     return _memory_hooker_data()
 
 
+@app.get("/api/memory-save-config")
+def api_memory_save_config(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+    return _memory_save_config_data()
+
+
 @app.get("/api/notify-targets")
 def api_notify_targets(request: Request):
     blocked = _ensure_api_auth(request)
@@ -1681,6 +1904,34 @@ async def _request_json_payload(request: Request) -> dict:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+@app.post("/api/memory-save-config")
+async def api_update_memory_save_config(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+
+    payload = await _request_json_payload(request)
+    mode = payload.get("mode") if isinstance(payload.get("mode"), str) else None
+    return _set_memory_save_mode(mode)
+
+
+@app.post("/api/memory-save")
+async def api_memory_save(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+
+    payload = await _request_json_payload(request)
+    reason = payload.get("reason") if isinstance(payload.get("reason"), str) else "manual"
+    if reason not in {"manual", "auto_daily_23"}:
+        reason = "manual"
+
+    result = _memory_save_now(reason=reason)
+    _record_memory_save_result(result, reason=reason)
+    result["config"] = _memory_save_config_data()
+    return result
 
 
 @app.post("/api/notify-targets")
@@ -1723,7 +1974,8 @@ async def api_test_notify_target(request: Request):
 
     test_message = "\n".join(
         [
-            "*ClawQ Test Notification*",
+            "🧠 *ClawQ Testnachricht*",
+            "Wenn du das liest, funktioniert die Zustellung. ✅",
             f"scope: `{scope}`",
             f"repo: `{repo_name or '-'}`",
             f"branch: `{branch or '-'}`",
