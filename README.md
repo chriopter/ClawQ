@@ -2,6 +2,17 @@
 
 Simple password-protected ClawQ web GUI.
 
+## Features
+
+- Password-protected web dashboard with persistent auth cookie
+- Sidebar navigation for `Repos`, `Memory`, and `Status`
+- Repo sync overview with branch/upstream/dirty indicators
+- Repo Hooker with commit detection every 5 seconds and Signal notifications
+- Memory Hooker with dedicated Signal target and test-send action
+- Per-repo Signal target overrides plus global default target
+- Memory save controls: manual `Save` (commit+push) and daily autosave at 23:00
+- System widgets for cron jobs, resource usage, mapping, STT, and runtime health
+
 ## Run
 
 ```bash
