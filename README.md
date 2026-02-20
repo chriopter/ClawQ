@@ -20,12 +20,47 @@ CLAWQ_COOKIE_SECURE=true
 CLAWQ_COOKIE_SECRET="long-random-secret"
 ```
 
+Optional repository root override:
+
+```bash
+CLAWQ_REPOS_ROOT="/root/git"
+# README in Memory defaults to /root/workspaces/README.md
+# Optional override:
+# CLAWQ_README_PATH="/root/workspaces/README.md"
+```
+
+## Hooker Notifications
+
+Hooker notifications are always active.
+
+- `Repo Hooker` watches all discovered repos and detects new commits by `HEAD` changes.
+- `Memory Hooker` watches the repository that contains the Memory README (`/root/workspaces/README.md` by default).
+- Scan interval is 5 seconds.
+- Notifications are delivered through OpenClaw (`openclaw message send --channel signal ...`).
+
+Target routing:
+
+- Default target is the OpenClaw primary Signal contact (`channels.signal.allowFrom[0]`, fallback `channels.signal.account`).
+- Repo Hooker supports per-repo overrides in the table dropdown (`Default` means main contact).
+- Memory Hooker has its own dropdown target.
+- Group options in dropdowns include readable group names (derived from OpenClaw session metadata) plus a short group id.
+
+Test buttons:
+
+- `Test` sends a real Signal test notification to the currently selected target.
+- If a target is empty/invalid in UI state, the backend falls back to the default main contact.
+
 Auth cookie is long-lived (20 years) and effectively permanent unless password/secret changes or logout clears it.
 
 ## Routes
 
 - `/` dashboard (auth required)
 - `/api/status` JSON status (auth required)
+- `/api/repo-hooker` repo commit watcher snapshot (auth required)
+- `/api/memory-hooker` memory repo commit watcher snapshot (auth required)
+- `/api/notify-targets` get/update Signal notification targets (auth required)
+- `/api/notify-targets/repo` update per-repo target override (auth required)
+- `/api/notify-targets/test` send test notification to selected target (auth required)
 - `/health` basic liveness
 - `/login` login form
 
