@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -18,13 +19,74 @@ from markdown_it import MarkdownIt
 
 APP_START_UTC = datetime.now(timezone.utc)
 AUTH_COOKIE = "clawq_auth"
-README_PATH = Path("/root/workspaces/README.md")
 OPENCLAW_CONFIG_PATH = Path(os.path.expanduser("~/.openclaw/openclaw.json"))
 OPENCLAW_CRON_PATH = Path(os.path.expanduser("~/.openclaw/cron/jobs.json"))
 OPENCLAW_AGENTS_DIR = Path(os.path.expanduser("~/.openclaw/agents"))
 CLAUDE_CREDENTIALS_PATH = Path(os.path.expanduser("~/.claude/.credentials.json"))
 CLAUDE_STATS_PATH = Path(os.path.expanduser("~/.claude/stats-cache.json"))
-WORKSPACES_ROOT = Path("/root/workspaces")
+DEFAULT_REPOS_ROOT = Path("/root/git")
+LEGACY_WORKSPACES_ROOT = Path("/root/workspaces")
+DEFAULT_README_PATH = LEGACY_WORKSPACES_ROOT / "README.md"
+HOOKER_TARGETS_PATH = Path(os.path.expanduser("~/.openclaw/clawq-notify-targets.json"))
+HOOKER_SCAN_SECONDS = 5
+
+REPO_HOOKER_LAST_HEADS: dict[str, str] = {}
+MEMORY_HOOKER_LAST_HEAD = ""
+REPO_HOOKER_EVENT_LOG: list[dict] = []
+MEMORY_HOOKER_LAST_EVENT: dict | None = None
+SIGNAL_GROUP_NAME_CACHE: dict = {"loaded_at": 0.0, "data": {}}
+HOOKER_STATE_LOCK = threading.Lock()
+HOOKER_THREAD_STARTED = False
+
+
+def _env_path(name: str) -> Path | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    return Path(os.path.expanduser(value))
+
+
+def _has_direct_git_repos(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    try:
+        for entry in path.iterdir():
+            if entry.is_dir() and not entry.name.startswith(".") and (entry / ".git").exists():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _resolve_repos_root() -> Path:
+    override = _env_path("CLAWQ_REPOS_ROOT")
+    if override:
+        return override
+
+    if _has_direct_git_repos(DEFAULT_REPOS_ROOT):
+        return DEFAULT_REPOS_ROOT
+
+    if LEGACY_WORKSPACES_ROOT.exists():
+        return LEGACY_WORKSPACES_ROOT
+
+    return DEFAULT_REPOS_ROOT
+
+
+WORKSPACES_ROOT = _resolve_repos_root()
+
+
+def _resolve_readme_path() -> Path:
+    override = _env_path("CLAWQ_README_PATH")
+    if override:
+        return override
+
+    if DEFAULT_README_PATH.exists():
+        return DEFAULT_README_PATH
+
+    return WORKSPACES_ROOT / "README.md"
+
+
+README_PATH = _resolve_readme_path()
 
 
 def _password() -> str:
@@ -249,6 +311,7 @@ def _usage_stats_data() -> dict:
 def _settings_data() -> dict:
     return {
         "cookie_secure": _cookie_secure(),
+        "repos_root": str(WORKSPACES_ROOT),
         "readme_path": str(README_PATH),
         "readme_exists": README_PATH.exists(),
         "password_env_set": bool(os.getenv("CLAWQ_PASSWORD", "").strip()),
@@ -331,30 +394,23 @@ def _run_git(cwd: Path, *args: str) -> tuple[bool, str]:
 
 
 def _workspaces_sync_data() -> dict:
-    if not WORKSPACES_ROOT.exists():
-        return {
-            "path": str(WORKSPACES_ROOT),
-            "exists": False,
-            "is_git_repo": False,
-            "in_sync": False,
-            "status": "missing",
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-        }
+    checked_at = datetime.now(timezone.utc).isoformat()
 
-    ok_repo, _ = _run_git(WORKSPACES_ROOT, "rev-parse", "--is-inside-work-tree")
-    if not ok_repo:
+    memory_repo_root = _resolve_memory_repo_root()
+    if not memory_repo_root:
+        candidate = README_PATH.parent if README_PATH.parent.exists() else LEGACY_WORKSPACES_ROOT
         return {
-            "path": str(WORKSPACES_ROOT),
-            "exists": True,
+            "path": str(candidate),
+            "exists": candidate.exists(),
             "is_git_repo": False,
             "in_sync": False,
             "status": "not_git_repo",
-            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "checked_at": checked_at,
         }
 
-    ok_branch, branch = _run_git(WORKSPACES_ROOT, "rev-parse", "--abbrev-ref", "HEAD")
-    ok_upstream, upstream = _run_git(WORKSPACES_ROOT, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
-    ok_status, porcelain = _run_git(WORKSPACES_ROOT, "status", "--porcelain")
+    ok_branch, branch = _run_git(memory_repo_root, "rev-parse", "--abbrev-ref", "HEAD")
+    ok_upstream, upstream = _run_git(memory_repo_root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    ok_status, porcelain = _run_git(memory_repo_root, "status", "--porcelain")
 
     dirty_files = []
     if ok_status and porcelain:
@@ -365,7 +421,7 @@ def _workspaces_sync_data() -> dict:
     ahead = 0
     behind = 0
     if ok_upstream:
-        ok_counts, counts = _run_git(WORKSPACES_ROOT, "rev-list", "--left-right", "--count", "@{upstream}...HEAD")
+        ok_counts, counts = _run_git(memory_repo_root, "rev-list", "--left-right", "--count", "@{upstream}...HEAD")
         if ok_counts and counts:
             parts = counts.split()
             if len(parts) == 2:
@@ -387,7 +443,7 @@ def _workspaces_sync_data() -> dict:
         status = "no_upstream"
 
     return {
-        "path": str(WORKSPACES_ROOT),
+        "path": str(memory_repo_root),
         "exists": True,
         "is_git_repo": True,
         "branch": branch if ok_branch else "unknown",
@@ -398,7 +454,7 @@ def _workspaces_sync_data() -> dict:
         "dirty_files": dirty_files[:15],
         "in_sync": status == "synced",
         "status": status,
-        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checked_at": checked_at,
     }
 
 
@@ -465,9 +521,811 @@ def _repo_git_status(repo_path: Path) -> dict:
     }
 
 
+def _discover_repo_dirs() -> tuple[list[tuple[str, Path]], list[str]]:
+    discovered: list[tuple[str, Path]] = []
+    workspace_names: set[str] = set()
+    seen_paths: set[str] = set()
+
+    try:
+        entries = [entry for entry in WORKSPACES_ROOT.iterdir() if entry.is_dir() and not entry.name.startswith(".")]
+    except OSError:
+        return discovered, []
+
+    for workspace in entries:
+        repos_root = workspace / "data" / "repos"
+        if not repos_root.is_dir():
+            continue
+        workspace_names.add(workspace.name)
+        try:
+            repo_dirs = [repo_dir for repo_dir in repos_root.iterdir() if repo_dir.is_dir() and not repo_dir.name.startswith(".")]
+        except OSError:
+            continue
+        for repo_dir in repo_dirs:
+            if not (repo_dir / ".git").exists():
+                continue
+            key = str(repo_dir)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            discovered.append((workspace.name, repo_dir))
+
+    flat_workspace = WORKSPACES_ROOT.name or "root"
+    for repo_dir in entries:
+        if not (repo_dir / ".git").exists():
+            continue
+        key = str(repo_dir)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        workspace_names.add(flat_workspace)
+        discovered.append((flat_workspace, repo_dir))
+
+    return discovered, sorted(workspace_names)
+
+
+def _repo_head_snapshot(repo_path: Path) -> dict | None:
+    ok_head, head = _run_git(repo_path, "rev-parse", "HEAD")
+    if not ok_head or not head:
+        return None
+
+    ok_branch, branch = _run_git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
+    ok_subject, subject = _run_git(repo_path, "log", "-1", "--format=%s")
+    ok_commit_ts, commit_ts = _run_git(repo_path, "log", "-1", "--format=%ct")
+
+    committed_at = None
+    if ok_commit_ts and commit_ts.isdigit():
+        committed_at = datetime.fromtimestamp(int(commit_ts), tz=timezone.utc).isoformat()
+
+    return {
+        "path": str(repo_path),
+        "name": repo_path.name,
+        "branch": branch if ok_branch else "unknown",
+        "head": head,
+        "head_short": head[:8],
+        "subject": subject if ok_subject else "",
+        "committed_at": committed_at,
+    }
+
+
+def _signal_bindings_map() -> dict[str, str]:
+    config = _json_or_none(OPENCLAW_CONFIG_PATH)
+    if not isinstance(config, dict):
+        return {}
+
+    bindings = {}
+    for row in config.get("bindings", []):
+        if not isinstance(row, dict):
+            continue
+        agent_id = row.get("agentId")
+        match = row.get("match")
+        if not isinstance(agent_id, str) or not isinstance(match, dict):
+            continue
+        if match.get("channel") != "signal":
+            continue
+        peer = match.get("peer")
+        if not isinstance(peer, dict) or peer.get("kind") != "group":
+            continue
+        group_id = peer.get("id")
+        if isinstance(group_id, str) and group_id:
+            bindings[agent_id] = group_id
+    return bindings
+
+
+def _signal_channel_settings() -> dict:
+    config = _json_or_none(OPENCLAW_CONFIG_PATH)
+    if not isinstance(config, dict):
+        return {"enabled": False, "account": ""}
+
+    signal_cfg = config.get("channels", {}).get("signal", {})
+    if not isinstance(signal_cfg, dict):
+        signal_cfg = {}
+
+    return {
+        "enabled": bool(signal_cfg.get("enabled", False)),
+        "account": str(signal_cfg.get("account", "") or ""),
+    }
+
+
+def _mask_group_id(group_id: str | None) -> str | None:
+    if not group_id:
+        return None
+    if len(group_id) <= 12:
+        return group_id
+    return f"{group_id[:6]}...{group_id[-4:]}"
+
+
+def _mask_contact_id(contact: str | None) -> str | None:
+    if not contact:
+        return None
+    if len(contact) <= 8:
+        return contact
+    return f"{contact[:4]}...{contact[-2:]}"
+
+
+def _canonical_group_id(value: str) -> str:
+    group_id = value.strip()
+    if group_id.startswith("group:"):
+        group_id = group_id.split(":", 1)[1]
+    return group_id.lower()
+
+
+def _looks_like_encoded_group(text: str) -> bool:
+    value = text.strip()
+    if not value:
+        return False
+    if any(char in value for char in ["+", "/", "="]):
+        return True
+
+    compact = value.replace(" ", "")
+    if len(compact) >= 24:
+        allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+        if all(char in allowed for char in compact) and sum(char.isdigit() for char in compact) >= 4:
+            return True
+
+    if value.lower().startswith("group "):
+        tail = value[6:].replace(" ", "")
+        if len(tail) >= 20 and sum(char.isdigit() for char in tail) >= 4:
+            return True
+
+    return False
+
+
+def _signal_group_subjects_map() -> dict[str, str]:
+    global SIGNAL_GROUP_NAME_CACHE
+
+    now = time.time()
+    with HOOKER_STATE_LOCK:
+        cached = SIGNAL_GROUP_NAME_CACHE.get("data", {}) if isinstance(SIGNAL_GROUP_NAME_CACHE, dict) else {}
+        loaded_at = float(SIGNAL_GROUP_NAME_CACHE.get("loaded_at", 0.0)) if isinstance(SIGNAL_GROUP_NAME_CACHE, dict) else 0.0
+        if isinstance(cached, dict) and now - loaded_at < 60:
+            return dict(cached)
+
+    group_names: dict[str, str] = {}
+
+    for sessions_path in OPENCLAW_AGENTS_DIR.glob("*/sessions/sessions.json"):
+        sessions = _json_or_none(sessions_path)
+        if not isinstance(sessions, dict):
+            continue
+
+        for row in sessions.values():
+            if not isinstance(row, dict):
+                continue
+
+            origin_value = row.get("origin")
+            origin = origin_value if isinstance(origin_value, dict) else {}
+
+            group_value = row.get("groupId") if isinstance(row.get("groupId"), str) else ""
+            if not group_value and origin:
+                from_raw = origin.get("from")
+                to_raw = origin.get("to")
+                from_value = from_raw if isinstance(from_raw, str) else ""
+                to_value = to_raw if isinstance(to_raw, str) else ""
+                group_value = from_value if from_value.startswith("group:") else to_value
+            if not group_value:
+                continue
+
+            subject_raw = row.get("subject")
+            subject = subject_raw if isinstance(subject_raw, str) else ""
+            subject = subject.strip()
+            if not subject and origin:
+                label = origin.get("label") if isinstance(origin.get("label"), str) else ""
+                if isinstance(label, str) and " id:" in label:
+                    subject = label.split(" id:", 1)[0].strip()
+            if not subject:
+                display_raw = row.get("displayName")
+                display_name = display_raw if isinstance(display_raw, str) else ""
+                if display_name.startswith("signal:g-"):
+                    display_subject = display_name.split("signal:g-", 1)[1].strip()
+                    if display_subject and not _looks_like_encoded_group(display_subject):
+                        subject = display_subject.replace("-", " ").strip().title()
+            if subject and _looks_like_encoded_group(subject):
+                subject = ""
+            if not subject:
+                continue
+
+            canonical = _canonical_group_id(group_value)
+            if canonical and canonical not in group_names:
+                group_names[canonical] = subject
+
+    with HOOKER_STATE_LOCK:
+        SIGNAL_GROUP_NAME_CACHE = {"loaded_at": now, "data": dict(group_names)}
+
+    return group_names
+
+
+def _signal_main_contact() -> str | None:
+    config = _json_or_none(OPENCLAW_CONFIG_PATH)
+    if not isinstance(config, dict):
+        return None
+
+    signal_cfg = config.get("channels", {}).get("signal", {})
+    if not isinstance(signal_cfg, dict):
+        return None
+
+    allow_from = signal_cfg.get("allowFrom", [])
+    if isinstance(allow_from, list):
+        for entry in allow_from:
+            if isinstance(entry, str) and entry.strip():
+                return entry.strip()
+
+    account = signal_cfg.get("account")
+    if isinstance(account, str) and account.strip():
+        return account.strip()
+    return None
+
+
+def _hooker_target_options() -> list[dict]:
+    options = []
+    seen_values = set()
+    group_names = _signal_group_subjects_map()
+    bindings_map = _signal_bindings_map()
+
+    group_agents: dict[str, list[str]] = {}
+    for agent_id, group_id in bindings_map.items():
+        canonical = _canonical_group_id(group_id)
+        if canonical not in group_agents:
+            group_agents[canonical] = []
+        if agent_id not in group_agents[canonical]:
+            group_agents[canonical].append(agent_id)
+
+    main_contact = _signal_main_contact()
+    if main_contact:
+        value = f"contact:{main_contact}"
+        options.append(
+            {
+                "value": value,
+                "label": f"Hauptkontakt {_mask_contact_id(main_contact)}",
+                "kind": "contact",
+            }
+        )
+        seen_values.add(value)
+
+    group_ids = sorted(set(bindings_map.values()))
+    for group_id in group_ids:
+        value = f"group:{group_id}"
+        if value in seen_values:
+            continue
+
+        canonical = _canonical_group_id(group_id)
+        group_name = group_names.get(canonical, "").strip()
+        agents_hint = ", ".join(group_agents.get(canonical, [])[:2])
+
+        if group_name:
+            label = f"{group_name} ({_mask_group_id(group_id)})"
+        elif agents_hint:
+            label = f"Signal {agents_hint} ({_mask_group_id(group_id)})"
+        else:
+            label = f"Signal Gruppe {_mask_group_id(group_id)}"
+
+        options.append(
+            {
+                "value": value,
+                "label": label,
+                "kind": "group",
+            }
+        )
+        seen_values.add(value)
+
+    return options
+
+
+def _notification_targets_data() -> dict:
+    options = _hooker_target_options()
+    allowed_values = {row.get("value") for row in options if isinstance(row, dict)}
+
+    stored = _json_or_none(HOOKER_TARGETS_PATH)
+    if not isinstance(stored, dict):
+        stored = {}
+
+    default_target = options[0]["value"] if options else None
+    memory_target = stored.get("memory_target") if stored.get("memory_target") in allowed_values else default_target
+
+    repo_overrides = {}
+    raw_repo_overrides = stored.get("repo_overrides")
+    if isinstance(raw_repo_overrides, dict):
+        for repo_key, target_value in raw_repo_overrides.items():
+            if not isinstance(repo_key, str) or not isinstance(target_value, str):
+                continue
+            if target_value not in allowed_values:
+                continue
+            repo_overrides[repo_key] = target_value
+
+    return {
+        "options": options,
+        "memory_target": memory_target,
+        "default_target": default_target,
+        "repo_overrides": repo_overrides,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _target_meta(target_value: str | None) -> dict:
+    return {
+        "value": target_value,
+        "label": _target_label_for_value(target_value),
+    }
+
+
+def _write_notification_targets(memory_target: str | None, repo_overrides: dict[str, str]) -> None:
+    payload = {
+        "memory_target": memory_target,
+        "repo_overrides": repo_overrides,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        HOOKER_TARGETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HOOKER_TARGETS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _set_notification_targets(memory_target: str | None = None) -> dict:
+    current = _notification_targets_data()
+    options = current.get("options", []) if isinstance(current, dict) else []
+    allowed_values = {row.get("value") for row in options if isinstance(row, dict)}
+
+    next_memory = current.get("memory_target")
+    next_overrides = current.get("repo_overrides", {}) if isinstance(current.get("repo_overrides"), dict) else {}
+
+    if isinstance(memory_target, str) and memory_target in allowed_values:
+        next_memory = memory_target
+
+    _write_notification_targets(next_memory, next_overrides)
+    return _notification_targets_data()
+
+
+def _set_repo_notification_target(repo_path: str, target_value: str | None) -> dict:
+    repo_key = repo_path.strip()
+    if not repo_key:
+        return _notification_targets_data()
+
+    current = _notification_targets_data()
+    options = current.get("options", []) if isinstance(current, dict) else []
+    allowed_values = {row.get("value") for row in options if isinstance(row, dict)}
+    next_memory = current.get("memory_target")
+    next_overrides = dict(current.get("repo_overrides", {}) if isinstance(current.get("repo_overrides"), dict) else {})
+
+    if target_value in {None, "", "default", "__default__"}:
+        next_overrides.pop(repo_key, None)
+    elif isinstance(target_value, str) and target_value in allowed_values:
+        next_overrides[repo_key] = target_value
+
+    _write_notification_targets(next_memory, next_overrides)
+    return _notification_targets_data()
+
+
+def _repo_target_for_path(repo_path: str, targets: dict) -> tuple[str | None, bool]:
+    default_target = targets.get("default_target") if isinstance(targets, dict) else None
+    repo_overrides = targets.get("repo_overrides") if isinstance(targets, dict) else None
+    if isinstance(repo_overrides, dict):
+        value = repo_overrides.get(repo_path)
+        if isinstance(value, str):
+            return value, False
+    return default_target, True
+
+
+def _parse_signal_target(target_value: str | None) -> tuple[str, str] | None:
+    if not isinstance(target_value, str) or ":" not in target_value:
+        return None
+    kind, target_id = target_value.split(":", 1)
+    kind = kind.strip().lower()
+    target_id = target_id.strip()
+    if kind not in {"group", "contact"} or not target_id:
+        return None
+    return kind, target_id
+
+
+def _target_label_for_value(target_value: str | None) -> str:
+    parsed = _parse_signal_target(target_value)
+    if not parsed:
+        return "Kein Ziel"
+    kind, target_id = parsed
+    if kind == "group":
+        canonical = _canonical_group_id(target_id)
+        group_name = _signal_group_subjects_map().get(canonical, "").strip()
+        if group_name:
+            return f"{group_name} ({_mask_group_id(target_id)})"
+        bindings = _signal_bindings_map()
+        agent_hints = [agent for agent, group_id in bindings.items() if _canonical_group_id(group_id) == canonical]
+        if agent_hints:
+            return f"Signal {agent_hints[0]} ({_mask_group_id(target_id)})"
+        return f"Signal Gruppe {_mask_group_id(target_id)}"
+    return f"Hauptkontakt {_mask_contact_id(target_id)}"
+
+
+def _mask_target_value(target_value: str | None) -> str | None:
+    parsed = _parse_signal_target(target_value)
+    if not parsed:
+        return None
+    kind, target_id = parsed
+    if kind == "group":
+        return f"group:{_mask_group_id(target_id)}"
+    return f"contact:{_mask_contact_id(target_id)}"
+
+
+def _effective_signal_target(target_value: str | None) -> str | None:
+    if _parse_signal_target(target_value):
+        return target_value
+
+    targets = _notification_targets_data()
+    default_target = targets.get("default_target") if isinstance(targets, dict) else None
+    if isinstance(default_target, str) and _parse_signal_target(default_target):
+        return default_target
+
+    main_contact = _signal_main_contact()
+    if main_contact:
+        return f"contact:{main_contact}"
+
+    return None
+
+
+def _remote_commit_url(repo_path: Path, head: str) -> str | None:
+    ok_remote, remote = _run_git(repo_path, "remote", "get-url", "origin")
+    if not ok_remote or not remote:
+        return None
+
+    cleaned = remote.strip()
+    if cleaned.startswith("git@"):
+        host_path = cleaned.split("@", 1)[1]
+        if ":" not in host_path:
+            return None
+        host, path = host_path.split(":", 1)
+        cleaned = f"https://{host}/{path}"
+    elif cleaned.startswith("ssh://git@"):
+        host_path = cleaned.split("ssh://git@", 1)[1]
+        if "/" not in host_path:
+            return None
+        host, path = host_path.split("/", 1)
+        cleaned = f"https://{host}/{path}"
+    elif cleaned.startswith("http://"):
+        cleaned = f"https://{cleaned[7:]}"
+
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+
+    if not cleaned.startswith("https://"):
+        return None
+    return f"{cleaned}/commit/{head}"
+
+
+def _commit_numstat(repo_path: Path, head: str) -> dict:
+    ok_numstat, output = _run_git(repo_path, "show", "--numstat", "--format=", "--no-color", "--no-renames", head)
+    if not ok_numstat:
+        return {"files": [], "file_count": 0, "additions": 0, "deletions": 0}
+
+    files = []
+    additions_total = 0
+    deletions_total = 0
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        adds_raw, dels_raw = parts[0], parts[1]
+        path = parts[2]
+        additions = int(adds_raw) if adds_raw.isdigit() else 0
+        deletions = int(dels_raw) if dels_raw.isdigit() else 0
+        additions_total += additions
+        deletions_total += deletions
+        files.append(
+            {
+                "path": path,
+                "additions": additions,
+                "deletions": deletions,
+            }
+        )
+
+    return {
+        "files": files,
+        "file_count": len(files),
+        "additions": additions_total,
+        "deletions": deletions_total,
+    }
+
+
+def _format_commit_notification(snapshot: dict, numstat: dict, commit_url: str | None) -> str:
+    subject = str(snapshot.get("subject") or "(no subject)").replace("\n", " ").strip()
+    repo_name = str(snapshot.get("name") or "repo").replace("`", "'")
+    branch = str(snapshot.get("branch") or "unknown").replace("`", "'")
+
+    file_rows = numstat.get("files", []) if isinstance(numstat, dict) else []
+    rendered_files = []
+    for row in file_rows[:3]:
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("path") or "file").replace("```", "'''").strip()
+        additions = int(row.get("additions") or 0)
+        deletions = int(row.get("deletions") or 0)
+        rendered_files.append(f"{path} (+{additions} -{deletions})")
+
+    file_count = int(numstat.get("file_count") or 0) if isinstance(numstat, dict) else 0
+    additions_total = int(numstat.get("additions") or 0) if isinstance(numstat, dict) else 0
+    deletions_total = int(numstat.get("deletions") or 0) if isinstance(numstat, dict) else 0
+
+    lines = [
+        f"*Commit:* {subject}",
+        f"*Repo:* `{repo_name}/{branch}`",
+        f"*Change:* `{file_count} files +{additions_total} -{deletions_total}`",
+    ]
+
+    if rendered_files:
+        lines.append("")
+        lines.append("```")
+        lines.extend(rendered_files)
+        lines.append("```")
+
+    if commit_url:
+        lines.append("")
+        lines.append(f"*Link:* {commit_url}")
+    else:
+        head_short = str(snapshot.get("head_short") or "-").replace("`", "'")
+        lines.append("")
+        lines.append(f"*Head:* `{head_short}`")
+
+    return "\n".join(lines)
+
+
+def _send_signal_message(target_value: str | None, message: str) -> tuple[bool, str, str | None, str | None]:
+    effective_target = _effective_signal_target(target_value)
+    parsed = _parse_signal_target(effective_target)
+    if not parsed:
+        return False, "no_target", None, None
+    target_kind, target_id = parsed
+
+    signal_cfg = _signal_channel_settings()
+    if not signal_cfg.get("enabled"):
+        return False, "signal_channel_disabled", target_kind, None
+
+    account = str(signal_cfg.get("account") or "").strip()
+    if not account:
+        return False, "missing_signal_account", target_kind, None
+
+    target = f"group:{target_id}" if target_kind == "group" else target_id
+    command = [
+        "openclaw",
+        "message",
+        "send",
+        "--channel",
+        "signal",
+        "--target",
+        target,
+        "--message",
+        message,
+        "--json",
+    ]
+
+    last_details = None
+    for attempt in range(2):
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception as exc:
+            last_details = str(exc)
+            if attempt == 0:
+                time.sleep(0.6)
+                continue
+            return False, "signal_send_failed", target_kind, last_details
+
+        details = (completed.stderr or completed.stdout or "").strip()
+        if completed.returncode == 0:
+            return True, "sent", target_kind, None
+
+        if "Unknown target" in details:
+            return False, "invalid_target", target_kind, details
+
+        last_details = details
+        if attempt == 0:
+            time.sleep(0.6)
+            continue
+
+    return False, "signal_send_failed", target_kind, last_details
+
+
+def _build_commit_event(snapshot: dict, target_value: str | None) -> dict:
+    repo_path = Path(str(snapshot.get("path", "")))
+    head = str(snapshot.get("head") or "")
+    numstat = _commit_numstat(repo_path, head) if head else {"files": [], "file_count": 0, "additions": 0, "deletions": 0}
+    commit_url = _remote_commit_url(repo_path, head) if head else None
+    message = _format_commit_notification(snapshot, numstat, commit_url)
+
+    effective_target = _effective_signal_target(target_value)
+
+    notify = {
+        "sent": False,
+        "status": "no_target",
+        "target": _mask_target_value(effective_target),
+        "target_label": _target_label_for_value(effective_target),
+        "target_kind": None,
+        "error": None,
+    }
+    sent, status, target_kind, error = _send_signal_message(effective_target, message)
+    notify["sent"] = sent
+    notify["status"] = status
+    notify["target_kind"] = target_kind
+    notify["error"] = error
+
+    return {
+        "repo": snapshot.get("name"),
+        "workspace": snapshot.get("workspace"),
+        "branch": snapshot.get("branch"),
+        "head": head,
+        "head_short": snapshot.get("head_short"),
+        "subject": snapshot.get("subject"),
+        "committed_at": snapshot.get("committed_at"),
+        "url": commit_url,
+        "message": message,
+        "numstat": numstat,
+        "notify": notify,
+    }
+
+
+def _repo_hooker_data() -> dict:
+    global REPO_HOOKER_LAST_HEADS, REPO_HOOKER_EVENT_LOG
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    targets = _notification_targets_data()
+    default_target = targets.get("default_target")
+    raw_repo_overrides = targets.get("repo_overrides")
+    repo_overrides: dict[str, str] = raw_repo_overrides if isinstance(raw_repo_overrides, dict) else {}
+
+    if not WORKSPACES_ROOT.exists():
+        return {
+            "path": str(WORKSPACES_ROOT),
+            "repos": [],
+            "summary": {"total": 0},
+            "events": [],
+            "target_default": _target_meta(default_target),
+            "repo_overrides_count": len(repo_overrides),
+            "checked_at": checked_at,
+        }
+
+    discovered, _ = _discover_repo_dirs()
+    repos = []
+    for workspace_name, repo_dir in discovered:
+        snapshot = _repo_head_snapshot(repo_dir)
+        if not snapshot:
+            continue
+        snapshot["workspace"] = workspace_name
+
+        target_value, is_default = _repo_target_for_path(str(snapshot.get("path", "")), targets)
+        snapshot["notify_target"] = {
+            "value": target_value,
+            "label": _target_label_for_value(target_value),
+            "is_default": is_default,
+        }
+        repos.append(snapshot)
+
+    repos.sort(key=lambda item: (item.get("workspace", ""), item.get("name", "")))
+    changed_snapshots = []
+    current_heads = {}
+    for snapshot in repos:
+        repo_path = str(snapshot.get("path", ""))
+        current_head = str(snapshot.get("head", ""))
+        if repo_path and current_head:
+            current_heads[repo_path] = current_head
+
+    with HOOKER_STATE_LOCK:
+        for snapshot in repos:
+            repo_path = str(snapshot.get("path", ""))
+            current_head = str(snapshot.get("head", ""))
+            if not repo_path or not current_head:
+                continue
+            previous_head = REPO_HOOKER_LAST_HEADS.get(repo_path, "")
+            if previous_head and previous_head != current_head:
+                changed_snapshots.append(snapshot)
+        REPO_HOOKER_LAST_HEADS = current_heads
+
+    events = []
+    for snapshot in changed_snapshots:
+        notify_target = snapshot.get("notify_target") if isinstance(snapshot.get("notify_target"), dict) else {}
+        events.append(_build_commit_event(snapshot, notify_target.get("value")))
+
+    with HOOKER_STATE_LOCK:
+        if events:
+            REPO_HOOKER_EVENT_LOG = (events + REPO_HOOKER_EVENT_LOG)[:24]
+        events_out = REPO_HOOKER_EVENT_LOG[:12]
+
+    return {
+        "path": str(WORKSPACES_ROOT),
+        "repos": repos,
+        "summary": {"total": len(repos)},
+        "events": events_out,
+        "target_default": _target_meta(default_target),
+        "repo_overrides_count": len(repo_overrides),
+        "checked_at": checked_at,
+    }
+
+
+def _resolve_memory_repo_root() -> Path | None:
+    candidates = []
+    if README_PATH.exists():
+        candidates.append(README_PATH.parent)
+    candidates.extend([LEGACY_WORKSPACES_ROOT, WORKSPACES_ROOT])
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not candidate.exists():
+            continue
+
+        ok_root, root = _run_git(candidate, "rev-parse", "--show-toplevel")
+        if ok_root and root:
+            return Path(root)
+
+    return None
+
+
+def _memory_hooker_data() -> dict:
+    global MEMORY_HOOKER_LAST_HEAD, MEMORY_HOOKER_LAST_EVENT
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    targets = _notification_targets_data()
+    selected_target = targets.get("memory_target")
+    repo_root = _resolve_memory_repo_root()
+    if not repo_root:
+        return {
+            "readme_path": str(README_PATH),
+            "repo_path": None,
+            "found": False,
+            "reason": "not_git_repo",
+            "event": MEMORY_HOOKER_LAST_EVENT,
+            "target": _target_meta(selected_target),
+            "checked_at": checked_at,
+        }
+
+    snapshot = _repo_head_snapshot(repo_root)
+    if not snapshot:
+        return {
+            "readme_path": str(README_PATH),
+            "repo_path": str(repo_root),
+            "found": False,
+            "reason": "no_head",
+            "event": MEMORY_HOOKER_LAST_EVENT,
+            "target": _target_meta(selected_target),
+            "checked_at": checked_at,
+        }
+
+    current_head = str(snapshot.get("head", ""))
+    has_change = False
+    with HOOKER_STATE_LOCK:
+        if MEMORY_HOOKER_LAST_HEAD and current_head and MEMORY_HOOKER_LAST_HEAD != current_head:
+            has_change = True
+        MEMORY_HOOKER_LAST_HEAD = current_head
+
+    event = None
+    if has_change:
+        snapshot_for_event = dict(snapshot)
+        snapshot_for_event["workspace"] = "memory"
+        event = _build_commit_event(snapshot_for_event, selected_target)
+
+    with HOOKER_STATE_LOCK:
+        if event:
+            MEMORY_HOOKER_LAST_EVENT = event
+        last_event = MEMORY_HOOKER_LAST_EVENT
+
+    return {
+        "readme_path": str(README_PATH),
+        "repo_path": str(repo_root),
+        "found": True,
+        "head": snapshot.get("head"),
+        "head_short": snapshot.get("head_short"),
+        "branch": snapshot.get("branch"),
+        "subject": snapshot.get("subject"),
+        "committed_at": snapshot.get("committed_at"),
+        "event": last_event,
+        "target": _target_meta(selected_target),
+        "checked_at": checked_at,
+    }
+
+
 def _repos_status_data() -> dict:
     repos = []
-    workspaces = []
     if not WORKSPACES_ROOT.exists():
         return {
             "path": str(WORKSPACES_ROOT),
@@ -477,22 +1335,11 @@ def _repos_status_data() -> dict:
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    for entry in WORKSPACES_ROOT.iterdir():
-        if entry.is_dir() and not entry.name.startswith("."):
-            workspaces.append(entry)
-
-    for workspace in workspaces:
-        repos_root = workspace / "data" / "repos"
-        if not repos_root.exists() or not repos_root.is_dir():
-            continue
-        for repo_dir in repos_root.iterdir():
-            if not repo_dir.is_dir() or repo_dir.name.startswith("."):
-                continue
-            if not (repo_dir / ".git").exists():
-                continue
-            repo_info = _repo_git_status(repo_dir)
-            repo_info["workspace"] = workspace.name
-            repos.append(repo_info)
+    discovered, workspaces = _discover_repo_dirs()
+    for workspace_name, repo_dir in discovered:
+        repo_info = _repo_git_status(repo_dir)
+        repo_info["workspace"] = workspace_name
+        repos.append(repo_info)
 
     repos.sort(key=lambda item: (item.get("workspace", ""), item.get("name", "")))
     synced = sum(1 for repo in repos if repo.get("in_sync"))
@@ -501,7 +1348,7 @@ def _repos_status_data() -> dict:
     return {
         "path": str(WORKSPACES_ROOT),
         "repos": repos,
-        "workspaces": sorted([workspace.name for workspace in workspaces]),
+        "workspaces": workspaces,
         "summary": {"total": len(repos), "synced": synced, "unsynced": unsynced},
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -660,6 +1507,27 @@ def _render_workspace_readme() -> tuple[str, str]:
     return "Workspace README", md.render(raw)
 
 
+def _hooker_background_loop() -> None:
+    while True:
+        try:
+            _repo_hooker_data()
+            _memory_hooker_data()
+        except Exception:
+            pass
+        time.sleep(HOOKER_SCAN_SECONDS)
+
+
+@app.on_event("startup")
+def startup_hooker_loop():
+    global HOOKER_THREAD_STARTED
+    with HOOKER_STATE_LOCK:
+        if HOOKER_THREAD_STARTED:
+            return
+        worker = threading.Thread(target=_hooker_background_loop, daemon=True, name="clawq-hooker-loop")
+        worker.start()
+        HOOKER_THREAD_STARTED = True
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -783,6 +1651,100 @@ def api_repos_status(request: Request):
     return _repos_status_data()
 
 
+@app.get("/api/repo-hooker")
+def api_repo_hooker(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+    return _repo_hooker_data()
+
+
+@app.get("/api/memory-hooker")
+def api_memory_hooker(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+    return _memory_hooker_data()
+
+
+@app.get("/api/notify-targets")
+def api_notify_targets(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+    return _notification_targets_data()
+
+
+async def _request_json_payload(request: Request) -> dict:
+    try:
+        payload = await request.json()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+@app.post("/api/notify-targets")
+async def api_update_notify_targets(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+
+    payload = await _request_json_payload(request)
+
+    memory_target = payload.get("memory_target") if isinstance(payload.get("memory_target"), str) else None
+    return _set_notification_targets(memory_target=memory_target)
+
+
+@app.post("/api/notify-targets/repo")
+async def api_update_repo_notify_target(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+
+    payload = await _request_json_payload(request)
+
+    repo_path = str(payload.get("repo_path") or "")
+    target = payload.get("target") if isinstance(payload.get("target"), str) else None
+    return _set_repo_notification_target(repo_path, target)
+
+
+@app.post("/api/notify-targets/test")
+async def api_test_notify_target(request: Request):
+    blocked = _ensure_api_auth(request)
+    if blocked:
+        return blocked
+
+    payload = await _request_json_payload(request)
+
+    target = payload.get("target") if isinstance(payload.get("target"), str) else None
+    scope = payload.get("scope") if isinstance(payload.get("scope"), str) else "manual"
+    repo_name = payload.get("repo") if isinstance(payload.get("repo"), str) else ""
+    branch = payload.get("branch") if isinstance(payload.get("branch"), str) else ""
+
+    test_message = "\n".join(
+        [
+            "*ClawQ Test Notification*",
+            f"scope: `{scope}`",
+            f"repo: `{repo_name or '-'}`",
+            f"branch: `{branch or '-'}`",
+            f"timestamp: `{datetime.now(timezone.utc).isoformat()}`",
+        ]
+    )
+
+    effective_target = _effective_signal_target(target)
+    sent, status, target_kind, error = _send_signal_message(effective_target, test_message)
+    return {
+        "sent": sent,
+        "status": status,
+        "target": _mask_target_value(effective_target),
+        "target_label": _target_label_for_value(effective_target),
+        "requested_target": _mask_target_value(target),
+        "target_kind": target_kind,
+        "error": error,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     blocked = require_auth(request)
@@ -790,12 +1752,19 @@ def home(request: Request):
         return blocked
 
     readme_title, readme_html = _render_workspace_readme()
+    notify_targets = _notification_targets_data()
+    notify_options = notify_targets.get("options") if isinstance(notify_targets.get("options"), list) else []
+    notify_memory_target = notify_targets.get("memory_target")
+    notify_default_target = notify_targets.get("default_target")
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "readme_title": readme_title,
             "readme_html": readme_html,
+            "notify_options": notify_options,
+            "notify_memory_target": notify_memory_target,
+            "notify_default_label": _target_label_for_value(notify_default_target),
             "status": _system_status(),
         },
     )
