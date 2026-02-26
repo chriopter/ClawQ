@@ -728,13 +728,26 @@ def _repo_git_status(repo_path: Path) -> dict:
     }
 
 
+def _load_clawqignore() -> set[str]:
+    """Load .clawqignore from WORKSPACES_ROOT — one repo/dir name per line, # comments."""
+    ignore_path = WORKSPACES_ROOT / ".clawqignore"
+    if not ignore_path.exists():
+        return set()
+    try:
+        lines = ignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return {line.strip() for line in lines if line.strip() and not line.strip().startswith("#")}
+    except OSError:
+        return set()
+
+
 def _discover_repo_dirs() -> tuple[list[tuple[str, Path]], list[str]]:
     discovered: list[tuple[str, Path]] = []
     workspace_names: set[str] = set()
     seen_paths: set[str] = set()
+    ignored = _load_clawqignore()
 
     try:
-        entries = [entry for entry in WORKSPACES_ROOT.iterdir() if entry.is_dir() and not entry.name.startswith(".")]
+        entries = [entry for entry in WORKSPACES_ROOT.iterdir() if entry.is_dir() and not entry.name.startswith(".") and entry.name not in ignored]
     except OSError:
         return discovered, []
 
@@ -744,7 +757,7 @@ def _discover_repo_dirs() -> tuple[list[tuple[str, Path]], list[str]]:
             continue
         workspace_names.add(workspace.name)
         try:
-            repo_dirs = [repo_dir for repo_dir in repos_root.iterdir() if repo_dir.is_dir() and not repo_dir.name.startswith(".")]
+            repo_dirs = [repo_dir for repo_dir in repos_root.iterdir() if repo_dir.is_dir() and not repo_dir.name.startswith(".") and repo_dir.name not in ignored]
         except OSError:
             continue
         for repo_dir in repo_dirs:
