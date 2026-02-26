@@ -1693,6 +1693,111 @@ def _mapping_data() -> dict:
         seen_bindings.add(key)
         deduped_signal_bindings.append(row)
 
+    # Resolve group names for bindings
+    group_names = _signal_group_subjects_map()
+    for row in deduped_signal_bindings:
+        if row.get("target_kind") == "group":
+            canonical = _canonical_group_id(row.get("target_id", ""))
+            name = group_names.get(canonical, "")
+            if name:
+                row["target_name"] = name
+
+    # Resolve contact names from signal-cli recipient DB
+    contact_names: dict[str, str] = {}
+    try:
+        import sqlite3 as _sqlite3
+        _db_path = Path.home() / ".local/share/signal-cli/data"
+        _account_json = _db_path / "accounts.json"
+        if _account_json.exists():
+            _accounts = json.loads(_account_json.read_text())
+            _account_path = None
+            _signal_account = signal_channel.get("account", "")
+            for _acc in _accounts.get("accounts", []):
+                if _acc.get("number") == _signal_account:
+                    _account_path = _acc.get("path")
+                    break
+            if _account_path:
+                _db_file = _db_path / f"{_account_path}.d" / "account.db"
+                if _db_file.exists():
+                    _conn = _sqlite3.connect(str(_db_file), timeout=2)
+                    try:
+                        for _row in _conn.execute("SELECT number, aci, profile_given_name, profile_family_name FROM recipient WHERE profile_given_name IS NOT NULL"):
+                            _number, _aci, _given, _family = _row
+                            _display = f"{_given or ''} {_family or ''}".strip()
+                            if _display:
+                                if _number:
+                                    contact_names[_number] = _display
+                                if _aci:
+                                    contact_names[_aci] = _display
+                                    contact_names[f"uuid:{_aci}"] = _display
+                    finally:
+                        _conn.close()
+    except Exception:
+        pass
+
+    # Build security assessment
+    dm_policy = signal_channel.get("dmPolicy", "pairing")
+    group_policy = signal_channel.get("groupPolicy", "allowlist")
+    allow_from_list = signal_channel.get("allowFrom", [])
+    group_allow_from_list = signal_channel.get("groupAllowFrom", [])
+
+    security_issues: list[dict] = []
+    security_ok: list[str] = []
+
+    if dm_policy == "disabled":
+        security_ok.append("DMs deaktiviert")
+    elif dm_policy == "allowlist":
+        dm_labels = []
+        for entry in allow_from_list:
+            name = contact_names.get(entry, "")
+            dm_labels.append(f"{name} ({entry})" if name else entry)
+        security_ok.append(f"DMs nur für: {', '.join(dm_labels)}")
+    elif dm_policy == "open":
+        security_issues.append({"level": "warn", "text": "DMs offen für jeden!"})
+    elif dm_policy == "pairing":
+        security_ok.append("DMs nur mit Pairing-Code")
+
+    if group_policy == "disabled":
+        security_ok.append("Gruppen deaktiviert")
+    elif group_policy == "allowlist":
+        bound_groups = len([b for b in deduped_signal_bindings if b.get("source") == "binding" and b.get("target_kind") == "group"])
+        security_ok.append(f"Nur {bound_groups} erlaubte Gruppe(n)")
+    elif group_policy == "open":
+        security_issues.append({"level": "warn", "text": "Bot reagiert in JEDER Gruppe!"})
+
+    has_wildcard = "*" in group_allow_from_list
+    if has_wildcard:
+        security_issues.append({"level": "info", "text": "groupAllowFrom: * — jeder in erlaubten Gruppen kann schreiben"})
+    elif group_allow_from_list:
+        # Group entries by resolved name to avoid duplicates like "Lina (phone)" + "Lina (uuid)"
+        _name_to_ids: dict[str, list[str]] = {}
+        for entry in group_allow_from_list:
+            name = contact_names.get(entry, "")
+            key = name if name else entry
+            _name_to_ids.setdefault(key, []).append(entry)
+        sender_labels = []
+        for key, ids in _name_to_ids.items():
+            if key == ids[0]:
+                # No name resolved — show raw id
+                sender_labels.append(key)
+            else:
+                sender_labels.append(key)
+        unique_count = len(_name_to_ids)
+        security_ok.append(f"{unique_count} erlaubte Sender in Gruppen: {', '.join(sender_labels)}")
+
+    security_score = "🟢 Sicher" if not security_issues else ("🟡 Hinweise" if all(i["level"] == "info" for i in security_issues) else "🔴 Unsicher")
+
+    # Annotate allowFrom/groupAllowFrom with contact names
+    allow_from_annotated = []
+    for entry in allow_from_list:
+        name = contact_names.get(entry, "")
+        allow_from_annotated.append({"id": entry, "name": name})
+
+    group_allow_from_annotated = []
+    for entry in group_allow_from_list:
+        name = contact_names.get(entry, "")
+        group_allow_from_annotated.append({"id": entry, "name": name})
+
     return {
         "default_workspace": defaults.get("workspace", "") if isinstance(defaults, dict) else "",
         "channels": channels,
@@ -1704,9 +1809,20 @@ def _mapping_data() -> dict:
             "groups": signal_groups,
             "contact_count": len(signal_contacts),
             "group_count": len(signal_groups),
+            "dmPolicy": dm_policy,
+            "groupPolicy": group_policy,
+            "allowFrom": allow_from_list,
+            "groupAllowFrom": group_allow_from_list,
+            "allowFromAnnotated": allow_from_annotated,
+            "groupAllowFromAnnotated": group_allow_from_annotated,
         },
         "signal_bindings": deduped_signal_bindings,
         "masked_auth": masked.get("auth", {}),
+        "security": {
+            "score": security_score,
+            "issues": security_issues,
+            "ok": security_ok,
+        },
     }
 
 

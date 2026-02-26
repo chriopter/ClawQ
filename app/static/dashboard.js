@@ -632,7 +632,8 @@ function renderMapping(data) {
   const signalContacts = Number(data.signal?.contact_count || 0);
   const signalGroups = Number(data.signal?.group_count || 0);
 
-  setMini("mappingSummaryMini", `${signalGroups} groups | ${signalBindings.length} bindings`);
+  const secScore = data.security?.score || "";
+  setMini("mappingSummaryMini", `${secScore} ${signalGroups}g | ${signalBindings.length}b`);
 
   const bindingRows = signalBindings
     .slice(0, 8)
@@ -649,18 +650,70 @@ function renderMapping(data) {
     .map((session) => `<li><span>${esc(short(session.agent, 16))}</span><code title="${esc(session.key)}">${esc(short(session.key, 28))}</code></li>`)
     .join("");
 
+  const dmPolicy = data.signal?.dmPolicy || "pairing";
+  const groupPolicy = data.signal?.groupPolicy || "allowlist";
+
+  const policyBadge = (policy) => {
+    const cls = policy === "open" ? "repo-badge unsynced" : policy === "disabled" ? "repo-badge" : "repo-badge synced";
+    return `<span class="${cls}">${esc(policy)}</span>`;
+  };
+
+  const allowFromAnnotated = (data.signal?.allowFromAnnotated || []).map(c => {
+    const name = c.name ? ` <span class="meta">(${esc(c.name)})</span>` : "";
+    return `<li><code>${esc(c.id)}</code>${name}</li>`;
+  }).join("") || "<li>—</li>";
+
+  const groupAllowFromAnnotated = (data.signal?.groupAllowFromAnnotated || []).map(c => {
+    const name = c.name ? ` <span class="meta">(${esc(c.name)})</span>` : "";
+    const wildcard = c.id === "*" ? ' <span class="alert-badge">WILDCARD</span>' : "";
+    return `<li><code>${esc(c.id)}</code>${name}${wildcard}</li>`;
+  }).join("") || "<li>—</li>";
+
+  // Enrich bindings with group names
+  const enrichedBindingRows = signalBindings
+    .slice(0, 12)
+    .map((binding) => {
+      const agent = binding.agent_id || binding.agentId || binding.agent || "-";
+      const kind = binding.target_kind || binding.match?.peer?.kind || "-";
+      const targetId = binding.target_id || binding.match?.peer?.id || "-";
+      const targetName = binding.target_name || "";
+      const display = targetName ? `${esc(targetName)}` : `<code title="${esc(targetId)}">${esc(short(targetId, 24))}</code>`;
+      const source = binding.source === "binding" ? "📌" : "↩️";
+      return `<li>${source} <span>${esc(short(agent, 16))}</span> → <strong>${esc(kind)}</strong> ${display}</li>`;
+    })
+    .join("");
+
+  // Security assessment
+  const security = data.security || {};
+  const securityScore = security.score || "—";
+  const securityIssues = (security.issues || []).map(i => {
+    const icon = i.level === "warn" ? "⚠️" : "ℹ️";
+    return `<li>${icon} ${esc(i.text)}</li>`;
+  }).join("");
+  const securityOk = (security.ok || []).map(t => `<li>✅ ${esc(t)}</li>`).join("");
+
   target.innerHTML = `
     <div class="metric-grid">
-      <div class="metric"><span class="k">Channels</span><strong>${channels}</strong></div>
+      <div class="metric"><span class="k">Security</span><strong>${securityScore}</strong></div>
+      <div class="metric"><span class="k">DM Policy</span><strong>${policyBadge(dmPolicy)}</strong></div>
+      <div class="metric"><span class="k">Group Policy</span><strong>${policyBadge(groupPolicy)}</strong></div>
       <div class="metric"><span class="k">Bindings</span><strong>${signalBindings.length}</strong></div>
-      <div class="metric"><span class="k">Signal Contacts</span><strong>${signalContacts}</strong></div>
-      <div class="metric"><span class="k">Signal Groups</span><strong>${signalGroups}</strong></div>
       <div class="metric"><span class="k">Sessions</span><strong>${sessions.length}</strong></div>
       <div class="metric"><span class="k">Default Workspace</span><strong>${esc(data.default_workspace || "-")}</strong></div>
     </div>
-    <div class="two-col">
-      <div><h3>Bindings</h3><ul class="compact-list">${bindingRows || "<li>No bindings</li>"}</ul></div>
-      <div><h3>Mapped Sessions</h3><ul class="compact-list compact-two">${sessionRows || "<li>No sessions</li>"}</ul></div>
+    ${(securityIssues || securityOk) ? `
+    <div class="security-box" style="margin:0.5rem 0;padding:0.5rem 0.75rem;border-radius:6px;background:var(--surface-alt, #1a1a2e);">
+      <ul class="compact-list" style="margin:0;">${securityOk}${securityIssues}</ul>
+    </div>` : ""}
+    <div class="three-col">
+      <div><h3>Bindings</h3><ul class="compact-list">${enrichedBindingRows || "<li>No bindings</li>"}</ul></div>
+      <div>
+        <h3>DM AllowFrom</h3>
+        <ul class="compact-list">${allowFromAnnotated}</ul>
+        <h3>Group AllowFrom</h3>
+        <ul class="compact-list">${groupAllowFromAnnotated}</ul>
+      </div>
+      <div><h3>Active Sessions</h3><ul class="compact-list compact-two">${sessionRows || "<li>No sessions</li>"}</ul></div>
     </div>
   `;
 }

@@ -479,7 +479,8 @@ body {
 }
 
 .two-col { display: grid; grid-template-columns: 1fr; gap: 0.45rem; }
-.two-col h3,
+.three-col { display: grid; grid-template-columns: 1fr; gap: 0.45rem; }
+.two-col h3, .three-col h3,
 .group-title {
   margin: 0 0 0.24rem;
   color: var(--muted);
@@ -871,8 +872,66 @@ body {
   }
 }
 
+/* Signal Mapping — Security Box */
+.security-box {
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: linear-gradient(135deg, #0b1324, #0f1a2f);
+  padding: 0.55rem 0.75rem;
+  margin: 0.5rem 0;
+}
+
+.security-box .compact-list {
+  gap: 0.22rem;
+}
+
+.security-box .compact-list li {
+  border: none;
+  background: transparent;
+  padding: 0.18rem 0.3rem;
+  font-size: 0.76rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+/* Policy badges in metrics */
+.metric .repo-badge {
+  font-size: 0.72rem;
+  padding: 0.08rem 0.42rem;
+}
+
+.repo-badge.unsynced {
+  background: var(--bad);
+  border-color: #9f1239;
+  color: #4a0e23;
+}
+
+/* Binding arrows */
+.compact-list li span.binding-arrow {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+/* Contact name annotations */
+.compact-list .meta {
+  margin-left: 0.25rem;
+  font-size: 0.68rem;
+  color: var(--ok);
+  max-width: none;
+}
+
+/* Wildcard alert in list */
+.compact-list .alert-badge {
+  font-size: 0.58rem;
+  padding: 0.02rem 0.28rem;
+  vertical-align: middle;
+  margin-left: 0.25rem;
+}
+
 @media (min-width: 1180px) {
   .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .span-2 { grid-column: 1 / -1; }
   .two-col { grid-template-columns: 1fr 1fr; }
+  .three-col { grid-template-columns: 1fr 1fr 1fr; }
 }
