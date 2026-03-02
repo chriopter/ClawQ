@@ -26,7 +26,7 @@ CLAUDE_CREDENTIALS_PATH = Path(os.path.expanduser("~/.claude/.credentials.json")
 CLAUDE_STATS_PATH = Path(os.path.expanduser("~/.claude/stats-cache.json"))
 DEFAULT_REPOS_ROOT = Path("/root/git")
 LEGACY_WORKSPACES_ROOT = Path("/root/workspaces")
-DEFAULT_README_PATH = LEGACY_WORKSPACES_ROOT / "README.md"
+
 HOOKER_TARGETS_PATH = Path(os.path.expanduser("~/.openclaw/clawq-notify-targets.json"))
 MEMORY_SAVE_CONFIG_PATH = Path(os.path.expanduser("~/.openclaw/clawq-memory-save.json"))
 HOOKER_SCAN_SECONDS = 5
@@ -76,19 +76,6 @@ def _resolve_repos_root() -> Path:
 
 WORKSPACES_ROOT = _resolve_repos_root()
 
-
-def _resolve_readme_path() -> Path:
-    override = _env_path("CLAWQ_README_PATH")
-    if override:
-        return override
-
-    if DEFAULT_README_PATH.exists():
-        return DEFAULT_README_PATH
-
-    return WORKSPACES_ROOT / "README.md"
-
-
-README_PATH = _resolve_readme_path()
 
 
 def _password() -> str:
@@ -314,8 +301,7 @@ def _settings_data() -> dict:
     return {
         "cookie_secure": _cookie_secure(),
         "repos_root": str(WORKSPACES_ROOT),
-        "readme_path": str(README_PATH),
-        "readme_exists": README_PATH.exists(),
+
         "password_env_set": bool(os.getenv("CLAWQ_PASSWORD", "").strip()),
         "cookie_secret_env_set": bool(os.getenv("CLAWQ_COOKIE_SECRET", "").strip()),
     }
@@ -605,7 +591,7 @@ def _workspaces_sync_data() -> dict:
 
     memory_repo_root = _resolve_memory_repo_root()
     if not memory_repo_root:
-        candidate = README_PATH.parent if README_PATH.parent.exists() else LEGACY_WORKSPACES_ROOT
+        candidate = LEGACY_WORKSPACES_ROOT
         return {
             "path": str(candidate),
             "exists": candidate.exists(),
@@ -1467,10 +1453,7 @@ def _repo_hooker_data() -> dict:
 
 
 def _resolve_memory_repo_root() -> Path | None:
-    candidates = []
-    if README_PATH.exists():
-        candidates.append(README_PATH.parent)
-    candidates.extend([LEGACY_WORKSPACES_ROOT, WORKSPACES_ROOT])
+    candidates = [LEGACY_WORKSPACES_ROOT, WORKSPACES_ROOT]
 
     seen = set()
     for candidate in candidates:
@@ -1497,7 +1480,6 @@ def _memory_hooker_data() -> dict:
     repo_root = _resolve_memory_repo_root()
     if not repo_root:
         return {
-            "readme_path": str(README_PATH),
             "repo_path": None,
             "found": False,
             "reason": "not_git_repo",
@@ -1509,7 +1491,6 @@ def _memory_hooker_data() -> dict:
     snapshot = _repo_head_snapshot(repo_root)
     if not snapshot:
         return {
-            "readme_path": str(README_PATH),
             "repo_path": str(repo_root),
             "found": False,
             "reason": "no_head",
@@ -1537,7 +1518,6 @@ def _memory_hooker_data() -> dict:
         last_event = MEMORY_HOOKER_LAST_EVENT
 
     return {
-        "readme_path": str(README_PATH),
         "repo_path": str(repo_root),
         "found": True,
         "head": snapshot.get("head"),
@@ -1839,16 +1819,6 @@ def _mapping_data() -> dict:
     }
 
 
-def _render_workspace_readme() -> tuple[str, str]:
-    if not README_PATH.exists():
-        return (
-            "README not found",
-            f"{README_PATH} does not exist.",
-        )
-
-    raw = README_PATH.read_text(encoding="utf-8", errors="replace")
-    return "Workspace README", md.render(raw)
-
 
 def _hooker_background_loop() -> None:
     while True:
@@ -2132,7 +2102,6 @@ def home(request: Request):
     if blocked:
         return blocked
 
-    readme_title, readme_html = _render_workspace_readme()
     notify_targets = _notification_targets_data()
     notify_options = notify_targets.get("options") if isinstance(notify_targets.get("options"), list) else []
     notify_memory_target = notify_targets.get("memory_target")
@@ -2141,8 +2110,6 @@ def home(request: Request):
         "index.html",
         {
             "request": request,
-            "readme_title": readme_title,
-            "readme_html": readme_html,
             "notify_options": notify_options,
             "notify_memory_target": notify_memory_target,
             "notify_default_label": _target_label_for_value(notify_default_target),

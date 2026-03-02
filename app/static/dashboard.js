@@ -503,7 +503,6 @@ function renderSettings(data) {
       <li><span>Cookie secure</span><strong>${data.cookie_secure ? "true" : "false"}</strong></li>
       <li><span>Password env</span><strong>${data.password_env_set ? "set" : "missing"}</strong></li>
       <li><span>Secret env</span><strong>${data.cookie_secret_env_set ? "set" : "derived"}</strong></li>
-      <li><span>README exists</span><strong>${data.readme_exists ? "yes" : "no"}</strong></li>
     </ul>
   `;
 }
@@ -942,7 +941,6 @@ function renderMemoryHooker(data) {
     ${eventCard}
     <ul class="kv-list">
       <li><span>Repo Path</span><strong>${esc(short(data.repo_path || "-", 52))}</strong></li>
-      <li><span>README Path</span><strong>${esc(short(data.readme_path || "-", 52))}</strong></li>
       <li><span>Latest Commit</span><strong title="${esc(data.subject || "")}">${esc(short(data.subject || "-", 62))}</strong></li>
       <li><span>Committed At</span><strong>${esc(formatShortTime(data.committed_at))}</strong></li>
     </ul>
